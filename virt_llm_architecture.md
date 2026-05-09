@@ -19,6 +19,7 @@ It currently validates:
 - A DMA engine command.
 - A RISC-V vector backend command.
 - A tensor core backend command.
+- Completion queue entries for every parsed command.
 - An invalid-opcode descriptor error path.
 
 ## Source Locations
@@ -100,6 +101,11 @@ All registers are currently 32-bit little-endian accesses.
 | `0x44` | `QUEUE_CTRL` | RW | Queue enable/reset bits |
 | `0x48` | `QUEUE_STATUS` | RO | Queue enabled/error status |
 | `0x4c` | `QUEUE_ERROR` | RO | Last queue error code |
+| `0x50` | `CQ_SIZE` | RW | Number of completion queue entries |
+| `0x54` | `CQ_ADDR_LO` | RW | Low 32 bits of completion queue DMA address |
+| `0x58` | `CQ_ADDR_HI` | RW | High 32 bits of completion queue DMA address |
+| `0x5c` | `CQ_HEAD` | RW | Guest-consumed completion index |
+| `0x60` | `CQ_TAIL` | RO | Device-produced completion index |
 
 Feature bits:
 
@@ -109,6 +115,7 @@ Feature bits:
 | 1 | `MSI` | Device advertises MSI support |
 | 2 | `MSI-X` | Device advertises MSI-X support |
 | 3 | `QCTRL` | Queue control/status/error registers exist |
+| 4 | `CQ` | Completion queue registers and entries exist |
 
 Interrupt bits:
 
@@ -157,6 +164,20 @@ struct virt_llm_desc {
     uint64_t rsvd1;
     uint64_t rsvd2;
     uint64_t rsvd3;
+};
+```
+
+The completion queue points to an array of compact 32-byte entries:
+
+```c
+struct virt_llm_cpl {
+    uint32_t command_id;
+    uint32_t opcode;
+    uint32_t backend;
+    uint32_t status;
+    uint32_t result;
+    uint32_t q_head;
+    uint64_t rsvd0;
 };
 ```
 
@@ -399,11 +420,11 @@ The existing 64-byte descriptor can carry the first backend experiments:
 | `len` | bytes or element count depending on opcode |
 | `status` | inline status for compatibility |
 | `result` | checksum or scalar result |
-| `rsvd0` | command id until a dedicated field exists |
+| `rsvd0` | command id mirrored into the CQ entry |
 | `rsvd1` | second input address or backend argument |
 | `rsvd2` | packed dimensions or backend argument |
 | `rsvd3` | extra backend argument |
 
-This lets the next QEMU iteration add DMA copy, vector add, and GEMM without
-breaking the current Linux driver. A later ABI revision should rename these
-reserved fields into explicit command fields.
+This let the QEMU model add DMA copy, vector add, and GEMM without breaking the
+current Linux driver. A later ABI revision should rename these reserved fields
+into explicit command fields.
