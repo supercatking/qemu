@@ -192,21 +192,47 @@ virt_llm_pci ... probe ok: magic=0x4c4c4d31 version=3 abi=1 q_max=1024 xfer_max=
 INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 ```
 
+## Implemented in the Dispatcher Backend Step
+
+This step implemented the first version of the architecture requested for the
+LLM PCIe accelerator:
+
+- Added a central QEMU command dispatcher.
+- Refactored opcode `0x0001` into the compatibility `INFER_XOR` backend.
+- Added opcode `0x0010` as a direct DMA engine `DMA_COPY` command.
+- Added opcode `0x0100` as a RISC-V vector backend `VECTOR_ADD_U32` command.
+- Added opcode `0x0200` as a tensor core backend `GEMM_U32` command.
+- Added QEMU debug logging for opcode, backend id, status, and result.
+- Updated the Linux validation driver to submit and verify one command per
+  backend.
+
+Validation result:
+
+```text
+virt_llm_pci ... dma inference ok: irq=intx ... checksum=0x000017e0
+virt_llm_pci ... dma copy ok: len=64 checksum=0x00002fe0
+virt_llm_pci ... vector add ok: count=8 checksum=0x00000360
+virt_llm_pci ... gemm ok: m=2 n=2 k=2 checksum=0x00000086
+virt_llm_pci ... error path ok: desc_status=0x80000002 q_status=0x00000003 q_error=3
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
+
 ## Immediate Next Coding Step
 
-The best next coding step after this architecture update is a small dispatcher
-slice:
+The best next coding step is to add a real completion queue:
 
-1. Add a QEMU command dispatcher function that maps opcode to backend.
-2. Keep existing `INFER_XOR` behavior as the compatibility command.
-3. Add `DMA_COPY` as the first DMA-engine opcode.
-4. Add `VECTOR_ADD_U32` as the first RISC-V vector backend opcode.
-5. Add `GEMM_U32` as the first tensor-core backend opcode.
-6. Update the Linux validation driver to submit one descriptor per backend.
-7. Re-run the riscv32 Linux 6.12 boot validation.
+1. Add CQ base/size/head/tail registers.
+2. Define a compact completion entry with command id, opcode, backend, status,
+   and result.
+3. Preserve inline descriptor status for compatibility while making Linux
+   consume CQ entries.
+4. Validate that the driver can submit several commands and receive completions
+   by command id.
+5. Re-run the riscv32 Linux 6.12 boot validation.
 
-This creates the hardware shape you described while keeping each operation
-deterministic and small enough to debug from kernel logs.
+This is the next important step because your target architecture says every
+operation eventually writes a CQ entry. Once CQ exists, softmax/pooling and
+more complex tensor commands can be added without changing completion behavior.
 
 ## Implementation Phases for the LLM Accelerator Shape
 
