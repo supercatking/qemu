@@ -257,14 +257,135 @@ The validation driver is expected to:
 The next stable shape should look like this:
 
 - BAR0 remains the control register aperture.
-- Queue configuration becomes explicit: queue reset, queue enable, queue status,
-  queue depth, and queue error.
-- Descriptors gain ownership and richer status codes.
-- Interrupt causes are split into completion, queue error, device error, and
-  reset completion.
+- Queue configuration becomes explicit: command queue reset, command queue
+  enable, completion queue reset, queue status, queue depth, and queue error.
+- Descriptors gain ownership, command ids, richer status codes, and completion
+  queue entries.
+- Interrupt causes are split into command completion, queue error, device
+  error, backend error, and reset completion.
 - QEMU moves command completion toward an asynchronous model using a timer or
   bottom half when latency simulation is enabled.
 - Linux grows a userspace entry point after the kernel self-test path is solid.
 
 That architecture keeps the current bring-up path intact while creating a
 natural route toward a usable simulated LLM accelerator.
+
+## Target Accelerator Architecture
+
+The intended LLM PCIe accelerator is organized around a hardware command queue
+front end. The queue front end does not execute every command itself. It parses
+each command descriptor, checks ownership and bounds, then dispatches the work
+to the correct internal execution block according to `opcode`.
+
+```mermaid
+flowchart LR
+    Guest["Linux driver / runtime"] --> CQ0["Command Queue"]
+    CQ0 --> FE["Command Parser and Dispatcher"]
+    FE --> DMA["DMA Engine"]
+    FE --> RVV["RISC-V Vector Processor"]
+    FE --> TC["Tensor Core"]
+    DMA --> Cpl["Completion Queue Entry"]
+    RVV --> Cpl
+    TC --> Cpl
+    Cpl --> IRQ["MSI-X / MSI / INTx"]
+    IRQ --> Guest
+```
+
+Execution blocks:
+
+| Block | Responsibility | Example opcodes |
+| --- | --- | --- |
+| Command parser | Descriptor ownership, opcode decode, bounds checks, backend dispatch | all commands |
+| DMA engine | Simple memory movement and fill/copy style commands | `DMA_COPY`, `DMA_FILL` |
+| RISC-V vector processor | Elementwise/vector kernels that map naturally to vector lanes | `VECTOR_ADD`, `SOFTMAX`, `POOLING` |
+| Tensor core | Matrix/tensor kernels with high arithmetic intensity | `GEMM`, future attention kernels |
+| Completion queue writer | Writes compact completion records and raises interrupts | all commands |
+
+### Command Queue and Completion Queue
+
+The current prototype stores completion status directly back into each command
+descriptor. The target architecture should add a separate completion queue so
+software can submit many commands and consume completions independently.
+
+Command queue entry responsibilities:
+
+- command id supplied by the driver/runtime;
+- opcode and flags;
+- DMA input/output addresses;
+- payload length or element count;
+- backend-specific arguments packed into reserved fields;
+- ownership bit from guest to device.
+
+Completion queue entry responsibilities:
+
+- command id;
+- completion status;
+- backend id;
+- result or checksum;
+- optional profiling fields such as cycles, bytes moved, or synthetic latency.
+
+The first implementation can keep descriptor inline completion for backward
+compatibility while adding CQ fields later.
+
+### Opcode Dispatch Policy
+
+Proposed opcode ranges:
+
+| Range | Backend | Purpose |
+| --- | --- | --- |
+| `0x0000_0001` | Compatibility path | Existing XOR inference self-test |
+| `0x0000_0010` - `0x0000_00ff` | DMA engine | copy, fill, scatter/gather later |
+| `0x0000_0100` - `0x0000_01ff` | RISC-V vector processor | vector add, softmax, pooling |
+| `0x0000_0200` - `0x0000_02ff` | Tensor core | GEMM and future tensor kernels |
+| `0x0000_ffff` | Test/error path | intentionally unsupported command |
+
+Initial concrete opcodes:
+
+| Opcode | Name | Backend | First validation behavior |
+| --- | --- | --- | --- |
+| `0x0001` | `INFER_XOR` | compatibility | byte-wise XOR transform |
+| `0x0010` | `DMA_COPY` | DMA engine | copy `len` bytes from input to output |
+| `0x0100` | `VECTOR_ADD_U32` | RISC-V vector | add two u32 arrays |
+| `0x0101` | `SOFTMAX_Q16` | RISC-V vector | fixed-point softmax approximation |
+| `0x0102` | `POOL_MAX_U32` | RISC-V vector | max-pooling over u32 windows |
+| `0x0200` | `GEMM_U32` | tensor core | small unsigned integer GEMM |
+
+### Backend Simulation Model
+
+The QEMU model should keep backend functions small and deterministic:
+
+- the DMA engine performs direct `pci_dma_read()` and `pci_dma_write()`;
+- the vector processor backend is represented by helper functions such as
+  `virt_llm_vector_add_u32()`;
+- the tensor core backend is represented by helper functions such as
+  `virt_llm_tensor_gemm_u32()`;
+- every backend returns a common status code and result checksum;
+- debug output or tracepoints should identify command id, opcode, backend,
+  status, and bytes/elements processed.
+
+The model should not try to emulate a real RISC-V vector ISA pipeline yet. The
+first target is architectural separation: commands that would run on the vector
+processor are dispatched to a vector backend, and tensor-heavy commands are
+dispatched to a tensor backend.
+
+### Descriptor Argument Convention
+
+The existing 64-byte descriptor can carry the first backend experiments:
+
+| Field | Common meaning |
+| --- | --- |
+| `opcode` | command opcode |
+| `flags` | ownership and command flags |
+| `input_addr` | first input buffer |
+| `output_addr` | output buffer |
+| `len` | bytes or element count depending on opcode |
+| `status` | inline status for compatibility |
+| `result` | checksum or scalar result |
+| `rsvd0` | command id until a dedicated field exists |
+| `rsvd1` | second input address or backend argument |
+| `rsvd2` | packed dimensions or backend argument |
+| `rsvd3` | extra backend argument |
+
+This lets the next QEMU iteration add DMA copy, vector add, and GEMM without
+breaking the current Linux driver. A later ABI revision should rename these
+reserved fields into explicit command fields.
