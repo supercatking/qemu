@@ -188,6 +188,8 @@ Current opcodes:
 | `0x0001` | `INFER_XOR` | compatibility | DMA-read input, write `input[i] ^ 0x5a` to output, return checksum |
 | `0x0010` | `DMA_COPY` | DMA engine | Copy `len` bytes from input to output and return byte checksum |
 | `0x0100` | `VECTOR_ADD_U32` | RISC-V vector | Add two u32 arrays and return output checksum |
+| `0x0101` | `SOFTMAX_Q16` | RISC-V vector | Normalize u32 inputs into Q16 probabilities |
+| `0x0102` | `POOL_MAX_U32` | RISC-V vector | Max-pool u32 windows |
 | `0x0200` | `GEMM_U32` | tensor core | Run a small u32 GEMM and return output checksum |
 
 Descriptor flags:
@@ -385,8 +387,8 @@ Implemented opcode status:
 | `INFER_XOR` | implemented and validated |
 | `DMA_COPY` | implemented and validated |
 | `VECTOR_ADD_U32` | implemented and validated |
-| `SOFTMAX_Q16` | planned |
-| `POOL_MAX_U32` | planned |
+| `SOFTMAX_Q16` | implemented and validated |
+| `POOL_MAX_U32` | implemented and validated |
 | `GEMM_U32` | implemented and validated |
 
 ### Backend Simulation Model
