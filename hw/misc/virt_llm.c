@@ -73,6 +73,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_OP_VEC_ADD_U32 0x0100
 #define VIRT_LLM_OP_SOFTMAX_Q16 0x0101
 #define VIRT_LLM_OP_POOL_MAX_U32 0x0102
+#define VIRT_LLM_OP_DOT_U32    0x0103
 #define VIRT_LLM_OP_GEMM_U32   0x0200
 #define VIRT_LLM_DESC_F_READY  BIT(0)
 #define VIRT_LLM_DESC_COMPLETE 1
@@ -98,8 +99,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_SCALAR_IDLE    0u
 #define VIRT_LLM_SCALAR_RUNNING 1u
 #define VIRT_LLM_SCALAR_ERROR   2u
-#define VIRT_LLM_SCALAR_KERNELS 4u
+#define VIRT_LLM_SCALAR_KERNELS 5u
 #define VIRT_LLM_KERNEL_VEC_ADD_U32 1u
+#define VIRT_LLM_KERNEL_DOT_U32 2u
 #define VIRT_LLM_KERNEL_SOFTMAX_Q16 3u
 #define VIRT_LLM_KERNEL_POOL_MAX_U32 4u
 
@@ -327,6 +329,35 @@ static uint32_t virt_llm_process_vec_add_u32(VirtLLMState *s,
     return VIRT_LLM_DESC_COMPLETE;
 }
 
+static uint32_t virt_llm_process_dot_u32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    g_autofree uint32_t *a = NULL;
+    g_autofree uint32_t *b = NULL;
+    uint64_t a_addr = le64_to_cpu(desc->input_addr);
+    uint64_t b_addr = le64_to_cpu(desc->rsvd1);
+    uint32_t count = le32_to_cpu(desc->len);
+    uint32_t dot = 0;
+    size_t bytes;
+
+    if (!a_addr || !b_addr || count == 0 ||
+        count > VIRT_LLM_MAX_XFER / sizeof(uint32_t)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    bytes = count * sizeof(uint32_t);
+    a = g_malloc(bytes);
+    b = g_malloc(bytes);
+    pci_dma_read(PCI_DEVICE(s), a_addr, a, bytes);
+    pci_dma_read(PCI_DEVICE(s), b_addr, b, bytes);
+
+    for (uint32_t i = 0; i < count; i++) {
+        dot += le32_to_cpu(a[i]) * le32_to_cpu(b[i]);
+    }
+
+    desc->result = cpu_to_le32(dot);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
 static uint32_t virt_llm_process_softmax_q16(VirtLLMState *s,
                                              VirtLLMDesc *desc)
 {
@@ -435,6 +466,10 @@ static uint32_t virt_llm_scalar_dispatch(VirtLLMState *s, VirtLLMDesc *desc,
         status = kernel_id == VIRT_LLM_KERNEL_VEC_ADD_U32 ?
                  virt_llm_process_vec_add_u32(s, desc) : VIRT_LLM_DESC_UNSUPP;
         break;
+    case VIRT_LLM_OP_DOT_U32:
+        status = kernel_id == VIRT_LLM_KERNEL_DOT_U32 ?
+                 virt_llm_process_dot_u32(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        break;
     case VIRT_LLM_OP_SOFTMAX_Q16:
         status = kernel_id == VIRT_LLM_KERNEL_SOFTMAX_Q16 ?
                  virt_llm_process_softmax_q16(s, desc) : VIRT_LLM_DESC_UNSUPP;
@@ -512,6 +547,7 @@ static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
         *backend = VIRT_LLM_BACKEND_DMA;
         return virt_llm_process_dma_copy(s, desc);
     case VIRT_LLM_OP_VEC_ADD_U32:
+    case VIRT_LLM_OP_DOT_U32:
     case VIRT_LLM_OP_SOFTMAX_Q16:
     case VIRT_LLM_OP_POOL_MAX_U32:
         *backend = VIRT_LLM_BACKEND_SCALAR;

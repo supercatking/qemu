@@ -144,7 +144,7 @@ Initial kernel ids:
 | Kernel id | Name | Supports |
 | --- | --- | --- |
 | `1` | `vec_add_u32` | `VECTOR_ADD_U32` |
-| `2` | `dot_u32` | planned `DOT_U32` |
+| `2` | `dot_u32` | `DOT_U32` |
 | `3` | `softmax_q16` | `SOFTMAX_Q16` |
 | `4` | `pool_max_u32` | `POOL_MAX_U32` |
 
@@ -204,6 +204,8 @@ Validation:
 - Logs show scalar status, last kernel id, and last opcode.
 
 ### Phase 2: Dot Product Kernel
+
+Status: implemented and validated.
 
 QEMU:
 
