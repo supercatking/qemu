@@ -19,6 +19,7 @@ It currently validates:
 - A DMA engine command.
 - A RISC-V vector backend command.
 - A tensor core backend command.
+- A tensor core 2D convolution command.
 - Completion queue entries for every parsed command.
 - An invalid-opcode descriptor error path.
 
@@ -192,6 +193,14 @@ Current opcodes:
 | `0x0102` | `POOL_MAX_U32` | RISC-V vector | Max-pool u32 windows |
 | `0x0103` | `DOT_U32` | RISC-V vector | Dot product over two u32 arrays |
 | `0x0200` | `GEMM_U32` | tensor core | Run a small u32 GEMM and return output checksum |
+| `0x0201` | `CONV2D_U32` | tensor core | Run valid u32 2D convolution and return output checksum |
+
+Tensor `CONV2D_U32` uses `input_addr` as the input image matrix, `rsvd1` as
+the kernel matrix address, and `output_addr` as the output matrix address.
+`rsvd2` packs input and kernel dimensions as `in_h[15:0]`, `in_w[31:16]`,
+`kernel_h[47:32]`, and `kernel_w[63:48]`. `rsvd3` packs output dimensions as
+`out_h[15:0]` and `out_w[31:16]`. The first implementation supports valid
+convolution with stride 1 and no padding.
 
 Descriptor flags:
 

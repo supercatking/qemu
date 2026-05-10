@@ -276,7 +276,7 @@ INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 
 ## Immediate Next Coding Step
 
-The next coding step is Phase 3 of the hardware plan:
+The Phase 3 tensor-core coding step has been implemented:
 
 1. Add tensor-core opcode `CONV2D_U32`.
 2. Route it directly to the tensor core backend, not through scalar dispatch.
@@ -288,6 +288,18 @@ The next coding step is Phase 3 of the hardware plan:
 
 This exercises the split between scalar-dispatched vector kernels and direct
 tensor-core kernels.
+
+Validation target:
+
+```text
+virt_llm_pci ... conv2d ok: input=3x3 kernel=2x2 output=2x2 checksum=0x00000028
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
+
+The next planned coding step is Phase 4: introduce a kernel binary metadata
+table for the internal RISC-V32 scalar dispatcher. That table should describe
+kernel id, supported opcode, ABI version, fake entry point, and binary length
+before any attempt to execute or interpret uploaded code.
 
 ## Implementation Phases for the LLM Accelerator Shape
 

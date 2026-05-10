@@ -75,6 +75,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_OP_POOL_MAX_U32 0x0102
 #define VIRT_LLM_OP_DOT_U32    0x0103
 #define VIRT_LLM_OP_GEMM_U32   0x0200
+#define VIRT_LLM_OP_CONV2D_U32 0x0201
 #define VIRT_LLM_DESC_F_READY  BIT(0)
 #define VIRT_LLM_DESC_COMPLETE 1
 #define VIRT_LLM_DESC_INVALID  0x80000001u
@@ -536,6 +537,68 @@ static uint32_t virt_llm_process_gemm_u32(VirtLLMState *s, VirtLLMDesc *desc)
     return VIRT_LLM_DESC_COMPLETE;
 }
 
+static uint32_t virt_llm_process_conv2d_u32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    g_autofree uint32_t *input = NULL;
+    g_autofree uint32_t *kernel = NULL;
+    g_autofree uint32_t *output = NULL;
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint64_t kernel_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+    uint64_t in_dims = le64_to_cpu(desc->rsvd2);
+    uint64_t out_dims = le64_to_cpu(desc->rsvd3);
+    uint32_t in_h = extract64(in_dims, 0, 16);
+    uint32_t in_w = extract64(in_dims, 16, 16);
+    uint32_t k_h = extract64(in_dims, 32, 16);
+    uint32_t k_w = extract64(in_dims, 48, 16);
+    uint32_t out_h = extract64(out_dims, 0, 16);
+    uint32_t out_w = extract64(out_dims, 16, 16);
+    uint32_t checksum = 0;
+    uint64_t input_elems = (uint64_t)in_h * in_w;
+    uint64_t kernel_elems = (uint64_t)k_h * k_w;
+    uint64_t output_elems = (uint64_t)out_h * out_w;
+
+    if (!input_addr || !kernel_addr || !output_addr ||
+        !in_h || !in_w || !k_h || !k_w || !out_h || !out_w ||
+        k_h > in_h || k_w > in_w ||
+        out_h != in_h - k_h + 1 || out_w != in_w - k_w + 1 ||
+        input_elems > VIRT_LLM_MAX_XFER / sizeof(uint32_t) ||
+        kernel_elems > VIRT_LLM_MAX_XFER / sizeof(uint32_t) ||
+        output_elems > VIRT_LLM_MAX_XFER / sizeof(uint32_t)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    input = g_malloc(input_elems * sizeof(uint32_t));
+    kernel = g_malloc(kernel_elems * sizeof(uint32_t));
+    output = g_new0(uint32_t, output_elems);
+    pci_dma_read(PCI_DEVICE(s), input_addr, input,
+                 input_elems * sizeof(uint32_t));
+    pci_dma_read(PCI_DEVICE(s), kernel_addr, kernel,
+                 kernel_elems * sizeof(uint32_t));
+
+    for (uint32_t oy = 0; oy < out_h; oy++) {
+        for (uint32_t ox = 0; ox < out_w; ox++) {
+            uint32_t sum = 0;
+
+            for (uint32_t ky = 0; ky < k_h; ky++) {
+                for (uint32_t kx = 0; kx < k_w; kx++) {
+                    uint32_t iv = le32_to_cpu(input[(oy + ky) * in_w + ox + kx]);
+                    uint32_t kv = le32_to_cpu(kernel[ky * k_w + kx]);
+
+                    sum += iv * kv;
+                }
+            }
+            output[oy * out_w + ox] = cpu_to_le32(sum);
+            checksum += sum;
+        }
+    }
+
+    pci_dma_write(PCI_DEVICE(s), output_addr, output,
+                  output_elems * sizeof(uint32_t));
+    desc->result = cpu_to_le32(checksum);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
 static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
                                        uint32_t opcode, uint32_t *backend)
 {
@@ -555,6 +618,9 @@ static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
     case VIRT_LLM_OP_GEMM_U32:
         *backend = VIRT_LLM_BACKEND_TENSOR;
         return virt_llm_process_gemm_u32(s, desc);
+    case VIRT_LLM_OP_CONV2D_U32:
+        *backend = VIRT_LLM_BACKEND_TENSOR;
+        return virt_llm_process_conv2d_u32(s, desc);
     default:
         *backend = UINT32_MAX;
         return VIRT_LLM_DESC_UNSUPP;

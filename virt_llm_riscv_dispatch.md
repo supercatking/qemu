@@ -151,6 +151,12 @@ Initial kernel ids:
 Tensor commands do not use the scalar dispatcher. GEMM and CONV are routed to
 the tensor core by opcode.
 
+`CONV2D_U32` uses `input_addr` for the input matrix, `rsvd1` for the kernel
+matrix, and `output_addr` for the output matrix. `rsvd2` packs
+`in_h | in_w << 16 | kernel_h << 32 | kernel_w << 48`; `rsvd3` packs
+`out_h | out_w << 16`. Phase 3 supports valid convolution only: stride 1 and
+no padding.
+
 ## Register Extension Plan
 
 Add read-only scalar dispatcher capability registers:
@@ -218,6 +224,8 @@ Linux:
 - Add known-answer dot product test.
 
 ### Phase 3: Tensor Core CONV
+
+Status: implemented and validated in the Phase 3 tensor-core step.
 
 QEMU:
 
