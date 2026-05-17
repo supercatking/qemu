@@ -83,6 +83,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_OP_DOT_U32    0x0103
 #define VIRT_LLM_OP_GEMM_U32   0x0200
 #define VIRT_LLM_OP_CONV2D_U32 0x0201
+#define VIRT_LLM_OP_ATTENTION_Q16 0x0202
 #define VIRT_LLM_DESC_F_READY  BIT(0)
 #define VIRT_LLM_DESC_COMPLETE 1
 #define VIRT_LLM_DESC_INVALID  0x80000001u
@@ -694,6 +695,109 @@ static uint32_t virt_llm_process_conv2d_u32(VirtLLMState *s, VirtLLMDesc *desc)
     return VIRT_LLM_DESC_COMPLETE;
 }
 
+static uint32_t virt_llm_exp_neg_q16(uint64_t delta)
+{
+    static const uint32_t lut[] = {
+        65536, 24109, 8869, 3263, 1201, 442, 163, 60, 22,
+    };
+    uint32_t whole = delta >> 16;
+    uint32_t frac = delta & 0xffff;
+    uint64_t frac_sq = ((uint64_t)frac * frac) >> 16;
+    uint32_t frac_exp = 65536 - frac + (frac_sq >> 1);
+
+    if (whole >= ARRAY_SIZE(lut)) {
+        return 0;
+    }
+
+    return ((uint64_t)lut[whole] * frac_exp + 0x8000) >> 16;
+}
+
+static uint32_t virt_llm_process_attention_q16(VirtLLMState *s,
+                                               VirtLLMDesc *desc)
+{
+    g_autofree uint32_t *q = NULL;
+    g_autofree uint32_t *k = NULL;
+    g_autofree uint32_t *v = NULL;
+    g_autofree uint32_t *out = NULL;
+    uint64_t q_addr = le64_to_cpu(desc->input_addr);
+    uint64_t k_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t v_addr = le64_to_cpu(desc->rsvd2);
+    uint64_t out_addr = le64_to_cpu(desc->output_addr);
+    uint32_t dims = le32_to_cpu(desc->len);
+    uint32_t seq_len = extract32(dims, 0, 16);
+    uint32_t head_dim = extract32(dims, 16, 16);
+    uint32_t elems = seq_len * head_dim;
+    uint32_t checksum = 0;
+    size_t bytes;
+
+    if (!q_addr || !k_addr || !v_addr || !out_addr ||
+        !seq_len || !head_dim || seq_len > 8 || head_dim > 8 ||
+        elems > VIRT_LLM_MAX_XFER / sizeof(uint32_t)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    bytes = elems * sizeof(uint32_t);
+    q = g_malloc(bytes);
+    k = g_malloc(bytes);
+    v = g_malloc(bytes);
+    out = g_new0(uint32_t, elems);
+    pci_dma_read(PCI_DEVICE(s), q_addr, q, bytes);
+    pci_dma_read(PCI_DEVICE(s), k_addr, k, bytes);
+    pci_dma_read(PCI_DEVICE(s), v_addr, v, bytes);
+
+    for (uint32_t row = 0; row < seq_len; row++) {
+        uint64_t scores[8] = { 0 };
+        uint32_t weights[8] = { 0 };
+        uint64_t max_score = 0;
+        uint64_t weight_sum = 0;
+        uint32_t cols = row + 1;
+
+        for (uint32_t col = 0; col < cols; col++) {
+            uint64_t acc = 0;
+
+            for (uint32_t d = 0; d < head_dim; d++) {
+                uint64_t qv = le32_to_cpu(q[row * head_dim + d]);
+                uint64_t kv = le32_to_cpu(k[col * head_dim + d]);
+
+                acc += (qv * kv) >> 16;
+            }
+            scores[col] = acc / head_dim;
+            if (col == 0 || scores[col] > max_score) {
+                max_score = scores[col];
+            }
+        }
+
+        for (uint32_t col = 0; col < cols; col++) {
+            uint64_t diff = max_score - scores[col];
+
+            weights[col] = virt_llm_exp_neg_q16(diff);
+            weight_sum += weights[col];
+        }
+
+        if (!weight_sum) {
+            return VIRT_LLM_DESC_BAD_LEN;
+        }
+
+        for (uint32_t d = 0; d < head_dim; d++) {
+            uint64_t sum = 0;
+
+            for (uint32_t col = 0; col < cols; col++) {
+                uint64_t prob = ((uint64_t)weights[col] << 16) / weight_sum;
+                uint64_t vv = le32_to_cpu(v[col * head_dim + d]);
+
+                sum += (prob * vv) >> 16;
+            }
+            sum = MIN(sum, (uint64_t)UINT32_MAX);
+            out[row * head_dim + d] = cpu_to_le32((uint32_t)sum);
+            checksum += (uint32_t)sum;
+        }
+    }
+
+    pci_dma_write(PCI_DEVICE(s), out_addr, out, bytes);
+    desc->result = cpu_to_le32(checksum);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
 static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
                                        uint32_t opcode, uint32_t *backend)
 {
@@ -716,6 +820,9 @@ static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
     case VIRT_LLM_OP_CONV2D_U32:
         *backend = VIRT_LLM_BACKEND_TENSOR;
         return virt_llm_process_conv2d_u32(s, desc);
+    case VIRT_LLM_OP_ATTENTION_Q16:
+        *backend = VIRT_LLM_BACKEND_TENSOR;
+        return virt_llm_process_attention_q16(s, desc);
     default:
         *backend = UINT32_MAX;
         return VIRT_LLM_DESC_UNSUPP;

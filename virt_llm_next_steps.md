@@ -397,3 +397,26 @@ Commit boundary:
   space for multiple queues?
 - Should this device model remain under `hw/misc`, or move later toward a
   dedicated accelerator directory if the model grows?
+
+## Attention Operator Milestone
+
+The next operator-level milestone adds a toy but complete attention command:
+
+- opcode `ATTENTION_Q16`;
+- tensor backend routing;
+- descriptor fields for Q, K, V, output, `seq_len`, `head_dim`, and causal
+  mask behavior;
+- Q16 `QK^T -> masked softmax -> P*V` simulation for `seq_len <= 8` and
+  `head_dim <= 8`;
+- Linux known-answer self-test using causal prefix averages.
+
+This milestone is intentionally small. It validates end-to-end attention data
+flow before moving to FP16/BF16, larger tiled GEMM, KV cache, or userspace
+runtime submission.
+
+Validation result:
+
+```text
+virt_llm_pci ... attention q16 ok: seq=3 head_dim=2 checksum=0x00035554
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
