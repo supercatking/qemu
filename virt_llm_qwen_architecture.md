@@ -54,3 +54,25 @@ continue to return `DESC_UNSUPP`; malformed tensor requests return
 
 The initial implementation runs FP32 tensors and treats BF16 weight conversion
 as a model-loader concern.
+
+## Tensor ids
+
+Device-owned Qwen weights use stable tensor ids so the guest graph can refer to
+model weights without DMA-uploading them every command.
+
+- `1`: `model.embed_tokens.weight`
+- `2`: `model.norm.weight`
+- Per layer: `1000 + layer * 16 + slot`
+- Layer slots:
+  - `0`: `input_layernorm.weight`
+  - `1`: `post_attention_layernorm.weight`
+  - `2`: `self_attn.q_proj.weight`
+  - `3`: `self_attn.k_proj.weight`
+  - `4`: `self_attn.v_proj.weight`
+  - `5`: `self_attn.o_proj.weight`
+  - `6`: `mlp.gate_proj.weight`
+  - `7`: `mlp.up_proj.weight`
+  - `8`: `mlp.down_proj.weight`
+
+HF linear weights are stored as `[out, in]`; the tensor backend presents them to
+`GEMM_F32` as `[in, out]` when used by the Qwen runtime.
