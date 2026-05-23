@@ -49,10 +49,41 @@ WSL outbound network access or placing a local SmolLM snapshot under
 
 ## Remaining Milestones
 
-1. Add Linux guest userspace access through `/dev/virt_llm0`.
-2. Add host-side weight conversion and guest-side model loading.
-3. Add Q8/Q16 transformer operators.
-4. Add KV cache and greedy decode loop.
-5. Run end-to-end SmolLM-135M-Instruct prompts in the guest.
-6. Add async execution, command graphs, tracing, and optional accelerated
+1. Add host-side weight conversion and guest-side model loading.
+2. Add Q8/Q16 transformer operators.
+3. Add KV cache and greedy decode loop.
+4. Run end-to-end SmolLM-135M-Instruct prompts in the guest.
+5. Add async execution, command graphs, tracing, and optional accelerated
    backends.
+
+## Milestone M2: Guest Userspace Runtime Interface
+
+Status: implemented in the Linux 6.12 driver.
+
+The driver now exposes `/dev/virt_llm0` as a misc character device with:
+
+- `GET_INFO`;
+- `ALLOC_BUFFER`;
+- `FREE_BUFFER`;
+- `SUBMIT_DESC`;
+- `WAIT_CQ`;
+- coherent DMA buffer mmap by handle.
+
+The probe selftests remain enabled by default and can be disabled with the
+`run_selftest` module parameter. Before registering `/dev/virt_llm0`, the driver
+resets and re-enables SQ/CQ so userspace starts from a clean queue state.
+
+The guest smoke test is a freestanding riscv32 `/init` program at
+`tools/testing/selftests/virt_llm/virt-llm-test.c` in the Linux tree. It creates
+the device node, allocates/mmap's DMA buffers, runs `GET_INFO`, submits
+`GEMM_U32`, submits `ATTENTION_Q16`, validates CQ entries and output data, then
+prints `INITRAMFS_OK`.
+
+Validation result:
+
+```text
+virt-llm-test info ok: magic=0x4c4c4d31 version=3
+virt-llm-test gemm ok: checksum=0x00000086
+virt-llm-test attention ok: checksum=0x0003f6ef
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
