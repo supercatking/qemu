@@ -101,3 +101,21 @@ virt-llm-test gemm ok: checksum=0x00000086
 virt-llm-test attention ok: checksum=0x0003f6ef
 INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 ```
+
+Manual validation is available through a separate console initramfs. It does not
+replace or modify the automated `/home/qemu/initramfs.cpio` path.
+
+```bash
+cd /mnt/c/Users/Admin/Documents/Codex/qemu
+./run_virt_llm_console.sh
+```
+
+The console supports:
+
+```text
+virt-llm> help
+virt-llm> info
+virt-llm> gemm
+virt-llm> attention
+virt-llm> reboot
+```
