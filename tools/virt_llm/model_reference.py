@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate SmolLM-135M-Instruct manifest and greedy-decode golden data."""
+"""Generate model manifest and greedy-decode golden data for virt-llm."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolLM-135M-Instruct"
+DEFAULT_ARTIFACT_PREFIX = "model"
 DEFAULT_PROMPTS = [
     "What is the capital of France?",
     "Write one short sentence about RISC-V.",
@@ -90,8 +91,8 @@ def config_to_manifest(model_id: str, config: Any) -> dict[str, Any]:
     return manifest
 
 
-def write_manifest(out_dir: Path, manifest: dict[str, Any]) -> Path:
-    manifest_path = out_dir / "smollm135_manifest.json"
+def write_manifest(out_dir: Path, prefix: str, manifest: dict[str, Any]) -> Path:
+    manifest_path = out_dir / f"{prefix}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                              encoding="utf-8")
     return manifest_path
@@ -138,6 +139,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", default=DEFAULT_MODEL)
     parser.add_argument("--out-dir", default="/home/qemu/virt-llm-artifacts/smollm135")
+    parser.add_argument("--artifact-prefix", default=DEFAULT_ARTIFACT_PREFIX)
     parser.add_argument("--prompt", action="append", default=[])
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cpu")
@@ -178,7 +180,7 @@ def main() -> int:
         }
     )
 
-    manifest_path = write_manifest(out_dir, manifest)
+    manifest_path = write_manifest(out_dir, args.artifact_prefix, manifest)
     print(f"Wrote {manifest_path}")
     if args.manifest_only:
         return 0
@@ -203,7 +205,7 @@ def main() -> int:
         ],
     }
 
-    golden_path = out_dir / "smollm135_golden.json"
+    golden_path = out_dir / f"{args.artifact_prefix}_golden.json"
     golden_path.write_text(json.dumps(golden, indent=2, sort_keys=True) + "\n",
                            encoding="utf-8")
 
