@@ -76,3 +76,11 @@ model weights without DMA-uploading them every command.
 
 HF linear weights are stored as `[out, in]`; the tensor backend presents them to
 `GEMM_F32` as `[in, out]` when used by the Qwen runtime.
+
+## Weight loading policy
+
+`MODEL_LOAD` parses only the safetensors header and builds the tensor table.
+Tensor payloads are loaded lazily when an op references a non-zero `tensor_id`.
+BF16 payloads are converted to FP32 inside QEMU.  This keeps device
+initialization fast and avoids allocating the full model until an operator
+actually needs a weight.

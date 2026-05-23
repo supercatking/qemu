@@ -104,7 +104,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_DESC_BAD_KERNEL 0x80000004u
 #define VIRT_LLM_DESC_BAD_TENSOR 0x80000005u
 #define VIRT_LLM_MAX_XFER      4096
-#define VIRT_LLM_TENSOR_MAX_XFER (64 * MiB)
+#define VIRT_LLM_TENSOR_MAX_XFER (1 * GiB)
 #define VIRT_LLM_Q_CTRL_ENABLE BIT(0)
 #define VIRT_LLM_Q_CTRL_RESET  BIT(1)
 #define VIRT_LLM_Q_STATUS_EN   BIT(0)
@@ -292,6 +292,7 @@ struct VirtLLMState {
     bool model_loaded;
     uint32_t model_tensor_count;
     uint32_t model_checksum;
+    uint64_t model_data_base;
     VirtLLMModelTensor model_tensors[VIRT_LLM_QWEN_TENSORS];
 };
 
@@ -1269,10 +1270,12 @@ static bool virt_llm_load_qwen_tensor_table(VirtLLMState *s)
     s->model_loaded = false;
     s->model_tensor_count = 0;
     s->model_checksum = 0;
+    s->model_data_base = 0;
 
     if (!virt_llm_read_safetensors_header(&json, &json_len)) {
         return false;
     }
+    s->model_data_base = 8 + json_len;
 
     if (!virt_llm_parse_safetensors_tensor(&s->model_tensors[count], json,
                                            json_len,
@@ -1314,6 +1317,143 @@ static bool virt_llm_load_qwen_tensor_table(VirtLLMState *s)
     s->model_tensor_count = count;
     s->model_checksum = checksum;
     return count == VIRT_LLM_QWEN_TENSORS;
+}
+
+static const VirtLLMModelTensor *virt_llm_find_model_tensor(VirtLLMState *s,
+                                                            uint32_t tensor_id)
+{
+    if (!s->model_loaded || !tensor_id) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < s->model_tensor_count; i++) {
+        if (s->model_tensors[i].tensor_id == tensor_id) {
+            return &s->model_tensors[i];
+        }
+    }
+    return NULL;
+}
+
+static bool virt_llm_model_tensor_elems(const VirtLLMModelTensor *tensor,
+                                        uint64_t *elems)
+{
+    uint64_t n = 1;
+
+    if (!tensor->rank || tensor->rank > ARRAY_SIZE(tensor->dims)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < tensor->rank; i++) {
+        if (!tensor->dims[i] ||
+            n > VIRT_LLM_TENSOR_MAX_XFER / tensor->dims[i]) {
+            return false;
+        }
+        n *= tensor->dims[i];
+    }
+    *elems = n;
+    return true;
+}
+
+static float virt_llm_bf16_to_f32(uint16_t raw)
+{
+    union {
+        uint32_t u;
+        float f;
+    } v = { .u = (uint32_t)raw << 16 };
+
+    return v.f;
+}
+
+static bool virt_llm_read_model_tensor_f32(VirtLLMState *s, uint32_t tensor_id,
+                                           bool transpose_2d, float **out,
+                                           uint32_t *rows, uint32_t *cols)
+{
+    const VirtLLMModelTensor *tensor = virt_llm_find_model_tensor(s, tensor_id);
+    g_autofree uint8_t *raw = NULL;
+    FILE *fp;
+    uint64_t elems;
+    uint64_t elem_size;
+    uint64_t expected_bytes;
+    uint64_t payload_bytes;
+    float *data;
+
+    if (!tensor || !virt_llm_model_tensor_elems(tensor, &elems) ||
+        elems > VIRT_LLM_TENSOR_MAX_XFER / sizeof(float)) {
+        return false;
+    }
+    elem_size = tensor->dtype == VIRT_LLM_DTYPE_BF16 ? 2 :
+                tensor->dtype == VIRT_LLM_DTYPE_F32 ? 4 : 0;
+    if (!elem_size) {
+        return false;
+    }
+    expected_bytes = elems * elem_size;
+    payload_bytes = tensor->data_end - tensor->data_begin;
+    if (payload_bytes != expected_bytes ||
+        payload_bytes > VIRT_LLM_TENSOR_MAX_XFER) {
+        return false;
+    }
+
+    fp = fopen(VIRT_LLM_SAFETENSORS_PATH, "rb");
+    if (!fp) {
+        return false;
+    }
+    if (fseeko(fp, s->model_data_base + tensor->data_begin, SEEK_SET) != 0) {
+        fclose(fp);
+        return false;
+    }
+    raw = g_malloc(payload_bytes);
+    if (fread(raw, 1, payload_bytes, fp) != payload_bytes) {
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+
+    data = g_malloc(elems * sizeof(float));
+    if (tensor->dtype == VIRT_LLM_DTYPE_BF16) {
+        for (uint64_t i = 0; i < elems; i++) {
+            uint16_t v = raw[i * 2] | ((uint16_t)raw[i * 2 + 1] << 8);
+
+            data[i] = virt_llm_bf16_to_f32(v);
+        }
+    } else {
+        memcpy(data, raw, elems * sizeof(float));
+    }
+
+    if (transpose_2d) {
+        float *transposed;
+        uint32_t r;
+        uint32_t c;
+
+        if (tensor->rank != 2) {
+            g_free(data);
+            return false;
+        }
+        r = tensor->dims[0];
+        c = tensor->dims[1];
+        transposed = g_malloc(elems * sizeof(float));
+        for (uint32_t row = 0; row < r; row++) {
+            for (uint32_t col = 0; col < c; col++) {
+                transposed[(uint64_t)col * r + row] =
+                    data[(uint64_t)row * c + col];
+            }
+        }
+        g_free(data);
+        data = transposed;
+        if (rows) {
+            *rows = c;
+        }
+        if (cols) {
+            *cols = r;
+        }
+    } else {
+        if (rows) {
+            *rows = tensor->rank > 0 ? tensor->dims[0] : 0;
+        }
+        if (cols) {
+            *cols = tensor->rank > 1 ? tensor->dims[1] : 1;
+        }
+    }
+
+    *out = data;
+    return true;
 }
 
 static uint32_t virt_llm_process_model_load(VirtLLMState *s,
@@ -1380,7 +1520,7 @@ static uint32_t virt_llm_process_embed_lookup_f32(VirtLLMState *s,
     seq = le32_to_cpu(req.dims[0]);
     hidden = le32_to_cpu(req.dims[1]);
     vocab = le32_to_cpu(req.dims[2]);
-    if (!input_addr || !weight_addr || !output_addr || !seq || !hidden ||
+    if (!input_addr || !output_addr || !seq || !hidden ||
         !vocab ||
         !virt_llm_tensor_bytes(seq, sizeof(uint32_t), &token_bytes) ||
         !virt_llm_tensor_bytes((uint64_t)vocab * hidden, sizeof(float),
@@ -1391,12 +1531,26 @@ static uint32_t virt_llm_process_embed_lookup_f32(VirtLLMState *s,
     }
 
     tokens = g_malloc(token_bytes);
-    embedding = g_malloc(embedding_bytes);
     out = g_malloc(out_bytes);
     pci_dma_read(PCI_DEVICE(s), input_addr + le32_to_cpu(req.input_offset),
                  tokens, token_bytes);
-    pci_dma_read(PCI_DEVICE(s), weight_addr + le32_to_cpu(req.weight_offset),
-                 embedding, embedding_bytes);
+    if (le32_to_cpu(req.tensor_id)) {
+        uint32_t rows;
+        uint32_t cols;
+
+        if (!virt_llm_read_model_tensor_f32(s, le32_to_cpu(req.tensor_id),
+                                            false, &embedding, &rows, &cols) ||
+            rows != vocab || cols != hidden) {
+            return VIRT_LLM_DESC_BAD_TENSOR;
+        }
+    } else {
+        if (!weight_addr) {
+            return VIRT_LLM_DESC_BAD_LEN;
+        }
+        embedding = g_malloc(embedding_bytes);
+        pci_dma_read(PCI_DEVICE(s), weight_addr + le32_to_cpu(req.weight_offset),
+                     embedding, embedding_bytes);
+    }
     for (uint32_t t = 0; t < seq; t++) {
         uint32_t token = le32_to_cpu(tokens[t]);
 
@@ -1431,7 +1585,7 @@ static uint32_t virt_llm_process_rmsnorm_f32(VirtLLMState *s, VirtLLMDesc *desc)
     }
     rows = le32_to_cpu(req.dims[0]);
     cols = le32_to_cpu(req.dims[1]);
-    if (!input_addr || !weight_addr || !output_addr || !rows || !cols ||
+    if (!input_addr || !output_addr || !rows || !cols ||
         !virt_llm_tensor_bytes((uint64_t)rows * cols, sizeof(float),
                                &input_bytes) ||
         !virt_llm_tensor_bytes(cols, sizeof(float), &weight_bytes)) {
@@ -1440,12 +1594,26 @@ static uint32_t virt_llm_process_rmsnorm_f32(VirtLLMState *s, VirtLLMDesc *desc)
 
     eps = (float)virt_llm_double_from_bits(le64_to_cpu(req.scalar0_bits), 1.0e-6);
     input = g_malloc(input_bytes);
-    weight = g_malloc(weight_bytes);
     out = g_malloc(input_bytes);
     pci_dma_read(PCI_DEVICE(s), input_addr + le32_to_cpu(req.input_offset),
                  input, input_bytes);
-    pci_dma_read(PCI_DEVICE(s), weight_addr + le32_to_cpu(req.weight_offset),
-                 weight, weight_bytes);
+    if (le32_to_cpu(req.tensor_id)) {
+        uint32_t w_rows;
+        uint32_t w_cols;
+
+        if (!virt_llm_read_model_tensor_f32(s, le32_to_cpu(req.tensor_id),
+                                            false, &weight, &w_rows, &w_cols) ||
+            w_rows * w_cols != cols) {
+            return VIRT_LLM_DESC_BAD_TENSOR;
+        }
+    } else {
+        if (!weight_addr) {
+            return VIRT_LLM_DESC_BAD_LEN;
+        }
+        weight = g_malloc(weight_bytes);
+        pci_dma_read(PCI_DEVICE(s), weight_addr + le32_to_cpu(req.weight_offset),
+                     weight, weight_bytes);
+    }
     for (uint32_t r = 0; r < rows; r++) {
         double ss = 0.0;
 
@@ -1590,19 +1758,33 @@ static uint32_t virt_llm_process_gemm_f32(VirtLLMState *s, VirtLLMDesc *desc)
     m = le32_to_cpu(req.dims[0]);
     n = le32_to_cpu(req.dims[1]);
     k = le32_to_cpu(req.dims[2]);
-    if (!a_addr || !b_addr || !c_addr || !m || !n || !k ||
+    if (!a_addr || !c_addr || !m || !n || !k ||
         !virt_llm_tensor_bytes((uint64_t)m * k, sizeof(float), &a_bytes) ||
         !virt_llm_tensor_bytes((uint64_t)k * n, sizeof(float), &b_bytes) ||
         !virt_llm_tensor_bytes((uint64_t)m * n, sizeof(float), &c_bytes)) {
         return VIRT_LLM_DESC_BAD_LEN;
     }
     a = g_malloc(a_bytes);
-    b = g_malloc(b_bytes);
     c = g_new0(float, (uint64_t)m * n);
     pci_dma_read(PCI_DEVICE(s), a_addr + le32_to_cpu(req.input_offset), a,
                  a_bytes);
-    pci_dma_read(PCI_DEVICE(s), b_addr + le32_to_cpu(req.weight_offset), b,
-                 b_bytes);
+    if (le32_to_cpu(req.tensor_id)) {
+        uint32_t w_rows;
+        uint32_t w_cols;
+
+        if (!virt_llm_read_model_tensor_f32(s, le32_to_cpu(req.tensor_id),
+                                            true, &b, &w_rows, &w_cols) ||
+            w_rows != k || w_cols != n) {
+            return VIRT_LLM_DESC_BAD_TENSOR;
+        }
+    } else {
+        if (!b_addr) {
+            return VIRT_LLM_DESC_BAD_LEN;
+        }
+        b = g_malloc(b_bytes);
+        pci_dma_read(PCI_DEVICE(s), b_addr + le32_to_cpu(req.weight_offset), b,
+                     b_bytes);
+    }
     for (uint32_t row = 0; row < m; row++) {
         for (uint32_t col = 0; col < n; col++) {
             double sum = 0.0;
@@ -2116,6 +2298,7 @@ static void virt_llm_reset(DeviceState *dev)
     s->model_loaded = false;
     s->model_tensor_count = 0;
     s->model_checksum = 0;
+    s->model_data_base = 0;
     memset(s->model_tensors, 0, sizeof(s->model_tensors));
     pci_set_irq(PCI_DEVICE(s), 0);
     msi_reset(PCI_DEVICE(s));
