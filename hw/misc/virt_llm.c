@@ -10,6 +10,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qom/object.h"
@@ -142,7 +143,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_QWEN_INTERMEDIATE 4864u
 #define VIRT_LLM_QWEN_VOCAB 151936u
 #define VIRT_LLM_QWEN_TENSORS (2u + VIRT_LLM_QWEN_LAYERS * 12u)
-#define VIRT_LLM_SAFETENSORS_PATH \
+#define VIRT_LLM_DEFAULT_SAFETENSORS_PATH \
     "/home/zyz/llmsim/models/qwen2.5-0.5b-instruct/model.safetensors"
 #define VIRT_LLM_SAFETENSORS_HEADER_MAX (16 * MiB)
 #define VIRT_LLM_TENSOR_ID_EMBED 1u
@@ -293,6 +294,7 @@ struct VirtLLMState {
     uint32_t model_tensor_count;
     uint32_t model_checksum;
     uint64_t model_data_base;
+    char *model_path;
     VirtLLMModelTensor model_tensors[VIRT_LLM_QWEN_TENSORS];
 };
 
@@ -1212,14 +1214,21 @@ static uint32_t virt_llm_tensor_checksum(const VirtLLMModelTensor *tensor,
     return checksum;
 }
 
-static bool virt_llm_read_safetensors_header(char **json, size_t *json_len)
+static const char *virt_llm_model_path(VirtLLMState *s)
+{
+    return s->model_path && s->model_path[0] ?
+           s->model_path : VIRT_LLM_DEFAULT_SAFETENSORS_PATH;
+}
+
+static bool virt_llm_read_safetensors_header(VirtLLMState *s, char **json,
+                                             size_t *json_len)
 {
     FILE *fp;
     uint8_t len_raw[8];
     uint64_t header_len = 0;
     char *buf;
 
-    fp = fopen(VIRT_LLM_SAFETENSORS_PATH, "rb");
+    fp = fopen(virt_llm_model_path(s), "rb");
     if (!fp) {
         return false;
     }
@@ -1275,7 +1284,7 @@ static bool virt_llm_load_qwen_tensor_table(VirtLLMState *s)
     s->model_checksum = 0;
     s->model_data_base = 0;
 
-    if (!virt_llm_read_safetensors_header(&json, &json_len)) {
+    if (!virt_llm_read_safetensors_header(s, &json, &json_len)) {
         return false;
     }
     s->model_data_base = 8 + json_len;
@@ -1394,7 +1403,7 @@ static bool virt_llm_read_model_tensor_f32(VirtLLMState *s, uint32_t tensor_id,
         return false;
     }
 
-    fp = fopen(VIRT_LLM_SAFETENSORS_PATH, "rb");
+    fp = fopen(virt_llm_model_path(s), "rb");
     if (!fp) {
         return false;
     }
@@ -1465,7 +1474,7 @@ static uint32_t virt_llm_process_model_load(VirtLLMState *s,
     if (!virt_llm_load_qwen_tensor_table(s)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "virt-llm: failed to parse safetensors metadata from %s\n",
-                      VIRT_LLM_SAFETENSORS_PATH);
+                      virt_llm_model_path(s));
         return VIRT_LLM_DESC_BAD_TENSOR;
     }
 
@@ -2323,6 +2332,17 @@ static void virt_llm_reset(DeviceState *dev)
     msix_reset(PCI_DEVICE(s));
 }
 
+static const Property virt_llm_properties[] = {
+    DEFINE_PROP_STRING("model-path", VirtLLMState, model_path),
+};
+
+static void virt_llm_instance_init(Object *obj)
+{
+    VirtLLMState *s = VIRT_LLM(obj);
+
+    s->model_path = g_strdup(VIRT_LLM_DEFAULT_SAFETENSORS_PATH);
+}
+
 static void virt_llm_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -2336,6 +2356,7 @@ static void virt_llm_class_init(ObjectClass *klass, const void *data)
     pc->class_id = PCI_CLASS_OTHERS;
 
     device_class_set_legacy_reset(dc, virt_llm_reset);
+    device_class_set_props(dc, virt_llm_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
@@ -2343,6 +2364,7 @@ static const TypeInfo virt_llm_info = {
     .name = TYPE_VIRT_LLM,
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(VirtLLMState),
+    .instance_init = virt_llm_instance_init,
     .class_init = virt_llm_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },

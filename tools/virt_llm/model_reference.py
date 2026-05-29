@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MODEL = "HuggingFaceTB/SmolLM-135M-Instruct"
+DEFAULT_MODEL = os.environ.get(
+    "VIRT_LLM_MODEL_ID",
+    os.environ.get("VIRT_LLM_MODEL_PATH", "/home/zyz/llmsim/models/qwen2.5-0.5b-instruct"),
+)
 DEFAULT_ARTIFACT_PREFIX = "model"
 DEFAULT_PROMPTS = [
     "What is the capital of France?",
@@ -36,8 +40,8 @@ def require_deps() -> tuple[Any, Any, Any, Any]:
             "Missing Python dependencies: "
             + ", ".join(missing)
             + "\nInstall example:\n"
-            + "  python3 -m venv /home/qemu/virt-llm-ref-venv\n"
-            + "  /home/qemu/virt-llm-ref-venv/bin/pip install "
+            + "  python3 -m venv ${VIRT_LLM_REF_VENV:-.venv-virt-llm-ref}\n"
+            + "  ${VIRT_LLM_REF_VENV:-.venv-virt-llm-ref}/bin/pip install "
             + "torch transformers safetensors huggingface_hub",
             file=sys.stderr,
         )
@@ -138,7 +142,10 @@ def run_generation(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", default=DEFAULT_MODEL)
-    parser.add_argument("--out-dir", default="/home/qemu/virt-llm-artifacts/smollm135")
+    parser.add_argument(
+        "--out-dir",
+        default=os.environ.get("VIRT_LLM_ARTIFACT_DIR", "./virt-llm-artifacts/qwen2.5-0.5b-instruct"),
+    )
     parser.add_argument("--artifact-prefix", default=DEFAULT_ARTIFACT_PREFIX)
     parser.add_argument("--prompt", action="append", default=[])
     parser.add_argument("--max-new-tokens", type=int, default=8)
