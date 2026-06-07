@@ -40,6 +40,34 @@ The backend value in CQ entries is used as a validation signal.  Unknown opcodes
 continue to return `DESC_UNSUPP`; malformed tensor requests return
 `DESC_BAD_LEN` or `DESC_BAD_TENSOR`.
 
+## Minimal true-inference validation
+
+The strict Qwen validation entry point is:
+
+```bash
+VIRT_LLM_MODEL_PATH=/path/to/qwen2.5-0.5b-instruct/model.safetensors \
+  /home/qemu/qemu/tools/virt_llm/run_virt_llm_qwen.sh
+```
+
+The script boots the RISC-V guest, passes `model-path` to the QEMU device,
+loads the safetensors model, runs the Qwen per-op graph, and now requires these
+markers:
+
+```text
+qwen model load ok
+qwen full layers ok
+QWEN_INFER_OK ...
+```
+
+`QWEN_SINGLE_TOKEN_OK` and `QWEN_DECODE_OK` are legacy smoke-test markers.  They
+are still useful for debugging older guest runtimes, but they are not accepted
+as the true-inference success condition.
+
+Current validation limits are fixed prompt/token fixture, batch size 1,
+full-context recompute, greedy generation, and no KV cache or tokenizer inside
+the virtual device.  The model file is not checked into git and must be supplied
+with `VIRT_LLM_MODEL_PATH` or the QEMU `model-path` device property.
+
 ## Initial Qwen constants
 
 - layers: 24
