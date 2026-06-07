@@ -125,6 +125,19 @@ def tensor_checksum(torch: Any, tensor: Any) -> dict[str, Any]:
     }
 
 
+def collect_top_logits(torch: Any, tokenizer: Any, logits: Any, top_k: int) -> list[dict[str, Any]]:
+    k = min(top_k, int(logits.numel()))
+    values, indices = torch.topk(logits.detach().to(torch.float32).cpu(), k=k)
+    return [
+        {
+            "token_id": int(token_id),
+            "logit": float(logit),
+            "text": token_text(tokenizer, int(token_id)),
+        }
+        for token_id, logit in zip(indices.tolist(), values.tolist())
+    ]
+
+
 def write_manifest(out_dir: Path, prefix: str, manifest: dict[str, Any]) -> Path:
     manifest_path = out_dir / f"{prefix}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -144,35 +157,51 @@ def run_generation(
     rendered = render_prompt(tokenizer, prompt)
     encoded = tokenizer(rendered, return_tensors="pt")
     encoded = {k: v.to(device) for k, v in encoded.items()}
+    current_ids = encoded["input_ids"]
+    attention_mask = encoded.get("attention_mask")
+    step_top_logits: list[dict[str, Any]] = []
+    first_logits = None
 
     with torch.no_grad():
-        logits = model(**encoded).logits[:, -1, :]
-        top_values, top_indices = torch.topk(logits[0], k=top_k)
-        generated = model.generate(
-            **encoded,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            top_k=None,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        for step in range(max_new_tokens):
+            model_inputs = {"input_ids": current_ids}
+            if attention_mask is not None:
+                model_inputs["attention_mask"] = attention_mask
+            logits = model(**model_inputs).logits[:, -1, :]
+            if first_logits is None:
+                first_logits = logits
+            selected_token_id = int(torch.argmax(logits[0]).detach().cpu().item())
+            step_top_logits.append(
+                {
+                    "step": step,
+                    "input_len": int(current_ids.shape[-1]),
+                    "selected_token_id": selected_token_id,
+                    "selected_token_text": token_text(tokenizer, selected_token_id),
+                    "top_logits": collect_top_logits(torch, tokenizer, logits[0], top_k),
+                }
+            )
+
+            next_token = torch.tensor(
+                [[selected_token_id]],
+                dtype=current_ids.dtype,
+                device=current_ids.device,
+            )
+            current_ids = torch.cat([current_ids, next_token], dim=-1)
+            if attention_mask is not None:
+                next_attention = torch.ones(
+                    (attention_mask.shape[0], 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat([attention_mask, next_attention], dim=-1)
 
     input_ids = encoded["input_ids"][0].detach().cpu().tolist()
-    output_ids = generated[0].detach().cpu().tolist()
+    output_ids = current_ids[0].detach().cpu().tolist()
     new_token_ids = output_ids[len(input_ids):]
     expected_first_new_token = new_token_ids[0] if new_token_ids else None
-    top_logits = [
-        {
-            "token_id": int(token_id),
-            "logit": float(logit),
-            "text": token_text(tokenizer, int(token_id)),
-        }
-        for token_id, logit in zip(
-            top_indices.detach().cpu().tolist(),
-            top_values.detach().cpu().tolist(),
-        )
-    ]
+    top_logits = step_top_logits[0]["top_logits"] if step_top_logits else []
+    if first_logits is None:
+        first_logits = torch.empty((1, 0), device=device)
     return {
         "prompt": prompt,
         "rendered_prompt": rendered,
@@ -187,7 +216,8 @@ def run_generation(
         ),
         "output_ids": output_ids,
         "top_logits": top_logits,
-        "last_prompt_logits_checksum": tensor_checksum(torch, logits),
+        "step_top_logits": step_top_logits,
+        "last_prompt_logits_checksum": tensor_checksum(torch, first_logits),
         "decoded_output": tokenizer.decode(output_ids, skip_special_tokens=False),
         "decoded_new_text": tokenizer.decode(new_token_ids, skip_special_tokens=False),
     }
@@ -287,6 +317,8 @@ def main() -> int:
         print(f"NEW_TOKEN_IDS: {item['new_token_ids']}")
         print(f"EXPECTED_FIRST_NEW_TOKEN: {item['expected_first_new_token']}")
         print(f"TOP_LOGITS: {item['top_logits']}")
+        if args.max_new_tokens > 1:
+            print(f"STEP_TOP_LOGITS: {item['step_top_logits']}")
         print(f"NEW_TEXT: {item['decoded_new_text']!r}")
     return 0
 
