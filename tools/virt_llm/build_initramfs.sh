@@ -25,19 +25,24 @@ case "$MODE" in
   *) echo "unsupported initramfs mode: $MODE" >&2; exit 2 ;;
 esac
 
+MARCH=$(virt_llm_riscv_march)
+MABI=$(virt_llm_riscv_mabi)
+virt_llm_step "build initramfs mode=$MODE guest=$VIRT_LLM_GUEST_ARCH out=$OUT"
 TMPBASE=${TMPDIR:-/tmp}
 WORK=$(mktemp -d "$TMPBASE/virt-llm-$MODE-initramfs.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/root"
 
 if [ "$MODE" = test ]; then
-  cat > "$WORK/init.S" <<'ASM'
+  MARKER=$(virt_llm_initramfs_marker)
+  MARKER_LEN=$((${#MARKER} + 1))
+  cat > "$WORK/init.S" <<ASM
 .section .text
 .global _start
 _start:
     li a0, 1
     la a1, msg
-    li a2, 48
+    li a2, $MARKER_LEN
     li a7, 64
     ecall
 
@@ -52,22 +57,22 @@ _start:
 
 .section .rodata
 msg:
-    .ascii "INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32\n"
+    .ascii "$MARKER\n"
 ASM
   "${CROSS_COMPILE}gcc" -nostdlib -static \
-    -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
+    -march="$MARCH" -mabi="$MABI" \
     -Wl,-e,_start -o "$WORK/root/init" "$WORK/init.S"
 elif [ "$MODE" = console ]; then
   SRC=$LINUX_SRC/tools/testing/selftests/virt_llm/virt-llm-console.c
   need_file LINUX_SRC "$SRC"
   "${CROSS_COMPILE}gcc" -nostdlib -static -ffreestanding -fno-builtin -Os \
-    -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
+    -march="$MARCH" -mabi="$MABI" \
     -o "$WORK/root/init" "$SRC"
 else
   SRC=$LINUX_SRC/tools/testing/selftests/virt_llm/virt-llm-qwen.c
   need_file LINUX_SRC "$SRC"
   "${CROSS_COMPILE}gcc" -nostdlib -static -ffreestanding -fno-builtin -Os \
-    -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
+    -march="$MARCH" -mabi="$MABI" \
     -o "$WORK/root/init" "$SRC"
 fi
 
