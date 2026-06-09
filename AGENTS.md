@@ -19,8 +19,9 @@ GitHub 或少量已批准站点。agent 必须按本文完成 virt-llm 的代码
 - 不下载或提交模型文件，不提交 build 目录、日志大文件、临时 cpio、内核 Image。
 - 不把 `/home/qemu`、`/home/zyz`、Windows 路径写成必需路径。
 - 所有路径必须通过环境变量配置；默认只使用当前目录下的 `work/`。
-- 网络只访问 GitHub。Qwen 模型不从 Hugging Face 下载，必须由本地已有文件通过
-  `VIRT_LLM_MODEL_PATH` 指定。
+- 网络至少需要访问 GitHub；QEMU configure 阶段还可能访问
+  `gitlab.com/qemu-project/*` 获取 Meson wrap subprojects。Qwen 模型不从
+  Hugging Face 下载，必须由本地已有文件通过 `VIRT_LLM_MODEL_PATH` 指定。
 - 如果网络白名单、缺少依赖或无管理员权限导致无法继续，必须输出失败报告，不能伪装成功。
 - 修改代码前先运行 `git status --short`，不得 revert 其他人已有改动。
 
@@ -37,7 +38,27 @@ LINUX_BRANCH=${LINUX_BRANCH:-llmdev-linux-6.12}
 
 不要切换到其他仓库或分支，除非任务明确要求。
 
-## 3. 标准环境变量
+## 3. 网络白名单
+
+最小白名单：
+
+```text
+github.com
+gitlab.com/qemu-project/keycodemapdb.git
+gitlab.com/qemu-project/berkeley-softfloat-3.git
+gitlab.com/qemu-project/berkeley-testfloat-3.git
+```
+
+说明：
+
+- QEMU/Linux 源码从 GitHub 拉取。
+- QEMU `configure` 使用 Meson wrap 时，可能从 `gitlab.com/qemu-project/*`
+  拉取上述 subprojects。
+- 不需要访问 Hugging Face。Qwen 模型必须是服务器本地已有文件。
+- 如果公司白名单只允许 GitHub 而不允许 GitLab，agent 必须报告网络阻塞；
+  不要改用未知镜像。
+
+## 4. 标准环境变量
 
 在普通用户可写目录中执行：
 
@@ -69,7 +90,7 @@ export VIRT_LLM_MODEL_PATH=/path/to/qwen2.5-0.5b-instruct/model.safetensors
 Qwen validation skipped: VIRT_LLM_MODEL_PATH is unset or missing
 ```
 
-## 4. 依赖预检查
+## 5. 依赖预检查
 
 先检查依赖，不要尝试安装：
 
@@ -77,7 +98,7 @@ Qwen validation skipped: VIRT_LLM_MODEL_PATH is unset or missing
 mkdir -p "$WORKDIR" "$REPORT_DIR"
 
 missing=0
-for tool in git python3 make ninja pkg-config "${CROSS_COMPILE}gcc"; do
+for tool in git python3 make ninja pkg-config cpio cc c++ "${CROSS_COMPILE}gcc"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "MISSING_DEPENDENCY: $tool"
     missing=1
@@ -93,17 +114,44 @@ fi
 如果 QEMU 或 Linux 编译后续报告缺少 `glib`、`pixman`、`openssl`、`flex`、`bison`、
 `bc` 等系统依赖，同样停止并写失败报告；不要使用 `sudo` 修复。
 
-## 5. Clone 代码
+## 6. Clone 代码
 
 ```bash
 mkdir -p "$WORKDIR"
 
+git_clone_retry() {
+  repo=$1
+  branch=$2
+  dest=$3
+
+  if [ -d "$dest/.git" ]; then
+    return 0
+  fi
+
+  rm -rf "$dest"
+  for attempt in 1 2 3 4 5; do
+    echo "clone attempt $attempt: $repo branch=$branch"
+    if git -c http.version=HTTP/1.1 clone \
+      --branch "$branch" \
+      --depth 1 \
+      --single-branch \
+      "$repo" "$dest"; then
+      return 0
+    fi
+    rm -rf "$dest"
+    sleep $((attempt * 5))
+  done
+
+  echo "CLONE_FAILED: $repo branch=$branch"
+  return 1
+}
+
 if [ ! -d "$QEMU_SRC/.git" ]; then
-  git clone --branch "$QEMU_BRANCH" --depth 1 "$QEMU_REPO" "$QEMU_SRC"
+  git_clone_retry "$QEMU_REPO" "$QEMU_BRANCH" "$QEMU_SRC"
 fi
 
 if [ ! -d "$LINUX_SRC/.git" ]; then
-  git clone --branch "$LINUX_BRANCH" --depth 1 "$LINUX_REPO" "$LINUX_SRC"
+  git_clone_retry "$LINUX_REPO" "$LINUX_BRANCH" "$LINUX_SRC"
 fi
 
 cd "$QEMU_SRC"
@@ -115,9 +163,10 @@ git status --short
 git rev-parse HEAD
 ```
 
-如果 GitHub 访问失败，不要改用未知镜像。报告网络白名单阻塞，并记录失败命令。
+如果 GitHub 或 QEMU GitLab subprojects 访问失败，不要改用未知镜像。
+报告网络白名单阻塞，并记录失败命令。
 
-## 6. 编译 QEMU
+## 7. 编译 QEMU
 
 ```bash
 cd "$QEMU_SRC"
@@ -134,7 +183,7 @@ $QEMU_BUILD/qemu-system-riscv32
 $QEMU_BUILD/qemu-system-riscv64
 ```
 
-## 7. 编译 Linux 6.12
+## 8. 编译 Linux 6.12
 
 rv32：
 
@@ -167,7 +216,7 @@ $WORKDIR/linux-build-rv32/arch/riscv/boot/Image
 $WORKDIR/linux-build-rv64/arch/riscv/boot/Image
 ```
 
-## 8. 基础验证
+## 9. 基础验证
 
 rv32：
 
@@ -205,7 +254,7 @@ INITRAMFS_OK
 
 如果缺失任意 marker，基础验证失败。
 
-## 9. Fresh clone 复现验证
+## 10. Fresh clone 复现验证
 
 该脚本会在 `/tmp` 或 `REPORT_DIR` 指定位置重新 clone、编译和验证，用于证明没有依赖
 当前工作树的隐藏状态：
@@ -230,7 +279,7 @@ $REPORT_DIR/fresh-repro/summary.md
 summary 必须显示 basic gate PASS。若 `VIRT_LLM_MODEL_PATH` 未设置，Qwen gate 可以 SKIP，
 但必须明确说明原因。
 
-## 10. 可选 Qwen exact-match 验证
+## 11. 可选 Qwen exact-match 验证
 
 只有当模型文件存在时运行：
 
@@ -263,7 +312,7 @@ QWEN_INFER_OK
 output_tokens=785,6722,315,9625,374,12095,13,151645
 ```
 
-## 11. 失败报告格式
+## 12. 失败报告格式
 
 任何失败都必须写入 `$REPORT_DIR/failure-report.md`。最小格式：
 
@@ -319,7 +368,7 @@ output_tokens=785,6722,315,9625,374,12095,13,151645
 
 失败报告必须包含第一处失败证据，而不是只写“运行失败”。
 
-## 12. 修改和提交规则
+## 13. 修改和提交规则
 
 - 修改前运行 `git status --short`。
 - 只提交源代码、脚本、文档和必要小型 fixture。
@@ -341,7 +390,7 @@ git diff --check
 - 如果改动影响 Linux driver 或 UAPI，必须同步修改 Linux 仓库并分别提交。
 - 如果只改 QEMU 文档，例如本文件，Linux 仓库不需要提交。
 
-## 13. 验收结论格式
+## 14. 验收结论格式
 
 完成后输出：
 
