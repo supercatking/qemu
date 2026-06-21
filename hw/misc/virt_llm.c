@@ -141,7 +141,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_QWEN_HEAD_DIM 64u
 #define VIRT_LLM_QWEN_INTERMEDIATE 4864u
 #define VIRT_LLM_QWEN_VOCAB 151936u
-#define VIRT_LLM_QWEN_TENSORS (2u + VIRT_LLM_QWEN_LAYERS * 9u)
+#define VIRT_LLM_QWEN_TENSORS (2u + VIRT_LLM_QWEN_LAYERS * 12u)
 #define VIRT_LLM_SAFETENSORS_PATH \
     "/home/zyz/llmsim/models/qwen2.5-0.5b-instruct/model.safetensors"
 #define VIRT_LLM_SAFETENSORS_HEADER_MAX (16 * MiB)
@@ -1260,6 +1260,9 @@ static bool virt_llm_load_qwen_tensor_table(VirtLLMState *s)
         "mlp.gate_proj.weight",
         "mlp.up_proj.weight",
         "mlp.down_proj.weight",
+        "self_attn.q_proj.bias",
+        "self_attn.k_proj.bias",
+        "self_attn.v_proj.bias",
     };
     g_autofree char *json = NULL;
     size_t json_len = 0;
@@ -1744,6 +1747,7 @@ static uint32_t virt_llm_process_gemm_f32(VirtLLMState *s, VirtLLMDesc *desc)
     VirtLLMTensorReq req;
     g_autofree float *a = NULL;
     g_autofree float *b = NULL;
+    g_autofree float *bias = NULL;
     g_autofree float *c = NULL;
     uint64_t a_addr = le64_to_cpu(desc->input_addr);
     uint64_t b_addr = le64_to_cpu(desc->rsvd1);
@@ -1785,6 +1789,17 @@ static uint32_t virt_llm_process_gemm_f32(VirtLLMState *s, VirtLLMDesc *desc)
         pci_dma_read(PCI_DEVICE(s), b_addr + le32_to_cpu(req.weight_offset), b,
                      b_bytes);
     }
+    if (le32_to_cpu(req.aux_tensor_id)) {
+        uint32_t bias_rows;
+        uint32_t bias_cols;
+
+        if (!virt_llm_read_model_tensor_f32(s, le32_to_cpu(req.aux_tensor_id),
+                                            false, &bias, &bias_rows,
+                                            &bias_cols) ||
+            (uint64_t)bias_rows * bias_cols != n) {
+            return VIRT_LLM_DESC_BAD_TENSOR;
+        }
+    }
     for (uint32_t row = 0; row < m; row++) {
         for (uint32_t col = 0; col < n; col++) {
             double sum = 0.0;
@@ -1792,6 +1807,9 @@ static uint32_t virt_llm_process_gemm_f32(VirtLLMState *s, VirtLLMDesc *desc)
             for (uint32_t inner = 0; inner < k; inner++) {
                 sum += (double)a[(uint64_t)row * k + inner] *
                        b[(uint64_t)inner * n + col];
+            }
+            if (bias) {
+                sum += bias[col];
             }
             c[(uint64_t)row * n + col] = (float)sum;
         }

@@ -73,6 +73,9 @@ model weights without DMA-uploading them every command.
   - `6`: `mlp.gate_proj.weight`
   - `7`: `mlp.up_proj.weight`
   - `8`: `mlp.down_proj.weight`
+  - `9`: `self_attn.q_proj.bias`
+  - `10`: `self_attn.k_proj.bias`
+  - `11`: `self_attn.v_proj.bias`
 
 HF linear weights are stored as `[out, in]`; the tensor backend presents them to
 `GEMM_F32` as `[in, out]` when used by the Qwen runtime.
