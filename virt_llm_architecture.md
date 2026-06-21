@@ -16,6 +16,9 @@ It currently validates:
 - Device DMA reads and writes through `pci_dma_read()` and `pci_dma_write()`.
 - Completion interrupts through MSI-X, MSI, or INTx fallback.
 - A deterministic simulated inference command.
+- A DMA engine command.
+- A RISC-V vector backend command.
+- A tensor core backend command.
 - An invalid-opcode descriptor error path.
 
 ## Source Locations
@@ -157,11 +160,14 @@ struct virt_llm_desc {
 };
 ```
 
-Current opcode:
+Current opcodes:
 
-| Opcode | Name | Behavior |
-| --- | --- | --- |
-| `1` | `INFER` | DMA-read input, write `input[i] ^ 0x5a` to output, return checksum |
+| Opcode | Name | Backend | Behavior |
+| --- | --- | --- | --- |
+| `0x0001` | `INFER_XOR` | compatibility | DMA-read input, write `input[i] ^ 0x5a` to output, return checksum |
+| `0x0010` | `DMA_COPY` | DMA engine | Copy `len` bytes from input to output and return byte checksum |
+| `0x0100` | `VECTOR_ADD_U32` | RISC-V vector | Add two u32 arrays and return output checksum |
+| `0x0200` | `GEMM_U32` | tensor core | Run a small u32 GEMM and return output checksum |
 
 Descriptor flags:
 
@@ -235,7 +241,8 @@ The validation driver is expected to:
 8. Enable the queue through `QUEUE_CTRL.ENABLE`.
 9. Submit one ready descriptor.
 10. Wait for interrupt-driven completion.
-11. Verify descriptor status, output bytes, and checksum.
+11. Verify descriptor status, output bytes, and checksum for compatibility,
+    DMA copy, vector add, and GEMM commands.
 12. Submit an unsupported opcode descriptor and verify the error interrupt,
     descriptor status, queue status, and queue error code.
 
@@ -349,6 +356,17 @@ Initial concrete opcodes:
 | `0x0101` | `SOFTMAX_Q16` | RISC-V vector | fixed-point softmax approximation |
 | `0x0102` | `POOL_MAX_U32` | RISC-V vector | max-pooling over u32 windows |
 | `0x0200` | `GEMM_U32` | tensor core | small unsigned integer GEMM |
+
+Implemented opcode status:
+
+| Opcode | Status |
+| --- | --- |
+| `INFER_XOR` | implemented and validated |
+| `DMA_COPY` | implemented and validated |
+| `VECTOR_ADD_U32` | implemented and validated |
+| `SOFTMAX_Q16` | planned |
+| `POOL_MAX_U32` | planned |
+| `GEMM_U32` | implemented and validated |
 
 ### Backend Simulation Model
 
