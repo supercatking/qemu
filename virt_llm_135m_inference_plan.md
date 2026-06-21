@@ -1,8 +1,21 @@
-# virt-llm 135M Instruct Inference Bring-up
+# virt-llm Local Instruct Model Bring-up
 
 ## Target
 
-The first real inference target is `HuggingFaceTB/SmolLM-135M-Instruct`.
+The current real inference target is the local model snapshot at
+`/home/zyz/llmsim/models/qwen2.5-0.5b-instruct`.
+
+This is Qwen2.5-0.5B-Instruct with:
+
+- model type: `qwen2`;
+- hidden size: 896;
+- layers: 24;
+- attention heads: 14;
+- KV heads: 2;
+- intermediate size: 4864;
+- vocab size: 151936;
+- weight file size: about 943 MB.
+
 The bring-up path starts with host-side reference generation, then adds a guest
 userspace ABI, model loading, transformer operators, KV cache, and finally an
 end-to-end greedy decode loop.
@@ -11,41 +24,42 @@ The initial functional target is correctness and observability, not performance.
 
 ## Milestone M1: Reference and Manifest
 
-Status: implemented by `tools/virt_llm/smollm135_reference.py`.
+Status: implemented by `tools/virt_llm/model_reference.py`.
 
 The reference tool:
 
-- loads `HuggingFaceTB/SmolLM-135M-Instruct` through Transformers;
+- loads a local Hugging Face model snapshot through Transformers;
 - records model config fields needed by the converter/runtime;
 - runs deterministic greedy decode for fixed short prompts;
 - writes:
-  - `smollm135_manifest.json`;
-  - `smollm135_golden.json`.
+  - `<artifact-prefix>_manifest.json`;
+  - `<artifact-prefix>_golden.json`.
 
 Example:
 
 ```bash
 python3 -m venv /home/qemu/virt-llm-ref-venv
-/home/qemu/virt-llm-ref-venv/bin/pip install -r tools/virt_llm/requirements-smollm135.txt
-/home/qemu/virt-llm-ref-venv/bin/python tools/virt_llm/smollm135_reference.py
+/home/qemu/virt-llm-ref-venv/bin/pip install -r tools/virt_llm/requirements-reference.txt
+/home/qemu/virt-llm-ref-venv/bin/python tools/virt_llm/model_reference.py \
+  --model-id /home/zyz/llmsim/models/qwen2.5-0.5b-instruct \
+  --local-files-only \
+  --out-dir /home/qemu/virt-llm-artifacts/qwen2.5-0.5b-instruct \
+  --artifact-prefix qwen2_5_0_5b
 ```
 
-If the model snapshot has already been downloaded or copied locally, pass the
-local path as `--model-id`:
+Current Qwen reference result:
 
-```bash
-/home/qemu/virt-llm-ref-venv/bin/python tools/virt_llm/smollm135_reference.py \
-  --model-id /home/qemu/models/smollm135 \
-  --local-files-only
+```text
+PROMPT: What is the capital of France?
+NEW_TOKEN_IDS: [785, 6722, 315, 9625, 374, 12095, 13, 151645]
+NEW_TEXT: 'The capital of France is Paris.<|im_end|>'
+PROMPT: Write one short sentence about RISC-V.
+NEW_TOKEN_IDS: [49, 27629, 19625, 374, 458, 1787, 30774, 17646]
+NEW_TEXT: 'RISC-V is an open-source architecture'
 ```
 
-When only the config is available, `--manifest-only` writes the config-derived
-manifest without loading the model weights.
-
-Current environment note: WSL HTTPS access to Hugging Face/GitHub timed out
-during bring-up, so generating golden token fixtures requires either restoring
-WSL outbound network access or placing a local SmolLM snapshot under
-`/home/qemu/models/smollm135`.
+The generated fixture files are checked in under
+`tests/fixtures/virt_llm/qwen2_5_0_5b`.
 
 ## Remaining Milestones
 
