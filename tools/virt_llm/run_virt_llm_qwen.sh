@@ -1,36 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
 
-SRC=/home/qemu/linux-6.12/tools/testing/selftests/virt_llm/virt-llm-qwen.c
-BIN=/tmp/virt-llm-qwen-rv32
-INITDIR=/tmp/virt-llm-qwen-initramfs
-INITRD=/home/qemu/initramfs-qwen.cpio
-LOG=/home/qemu/virt-llm-qwen.log
-
-riscv64-linux-gnu-gcc \
-  -nostdlib -static -ffreestanding -fno-builtin -Os \
-  -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
-  -o "$BIN" "$SRC"
-
-rm -rf "$INITDIR"
-mkdir -p "$INITDIR"
-cp "$BIN" "$INITDIR/init"
-chmod +x "$INITDIR/init"
-(cd "$INITDIR" && find . | cpio -o -H newc > "$INITRD")
-
+ensure_dirs
+need_exe QEMU_BIN "$QEMU_BIN"
+need_file LINUX_IMAGE "$LINUX_IMAGE"
+need_file VIRT_LLM_MODEL_PATH "$VIRT_LLM_MODEL_PATH"
+INITRD=${INITRD:-$VIRT_LLM_ARTIFACT_DIR/initramfs-qwen.cpio}
+"$SCRIPT_DIR/build_initramfs.sh" --mode qwen --out "$INITRD" >/dev/null
+LOG=${LOG:-$VIRT_LLM_LOG_DIR/virt-llm-qwen.log}
 rm -f "$LOG"
+
+rc=0
 timeout --foreground 900s \
-  /home/qemu/qemu/build/qemu-system-riscv32 \
+  "$QEMU_BIN" \
   -machine virt \
   -nographic \
   -m 512M \
   -smp 1 \
   -no-reboot \
-  -device virt-llm \
-  -kernel /home/qemu/linux-6.12-build-rv32/arch/riscv/boot/Image \
+  -device "$(virt_llm_device_arg)" \
+  -kernel "$LINUX_IMAGE" \
   -initrd "$INITRD" \
   -append "console=ttyS0 earlycon=sbi rdinit=/init loglevel=8" \
-  > "$LOG" 2>&1
+  > "$LOG" 2>&1 || rc=$?
 
 grep -E 'qwen |QWEN_|virt-llm:' "$LOG" | tail -120 || true
+echo "LOG_PATH=$LOG"
+test "$rc" -eq 0
 grep -q 'QWEN_SINGLE_TOKEN_OK' "$LOG"

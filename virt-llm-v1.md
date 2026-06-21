@@ -630,3 +630,47 @@ V1.0 establishes the end-to-end software/hardware interface:
 V1.0 deliberately leaves device DDR/SRAM, performance timing, KV cache
 residency, quantized kernels, and strict Hugging Face golden alignment for later
 milestones.
+
+
+## Environment Portability Notes
+
+V1.0 originally used the local development layout under `/home/qemu` and a local Qwen model under `/home/zyz/llmsim`. Current `llmdev` scripts keep those values as defaults, but they are now configuration defaults rather than hard requirements.
+
+### Configurable Variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `QEMU_SRC` | QEMU source tree containing `hw/misc/virt_llm.c` | directory two levels above `tools/virt_llm` |
+| `QEMU_BUILD` | QEMU build directory | `$QEMU_SRC/build` |
+| `QEMU_BIN` | RISC-V QEMU executable | `$QEMU_BUILD/qemu-system-riscv32` |
+| `LINUX_SRC` | Linux 6.12 source tree containing `virt_llm_pci.c` | `/home/qemu/linux-6.12` |
+| `LINUX_BUILD` | Linux riscv32 out-of-tree build directory | `/home/qemu/linux-6.12-build-rv32` |
+| `LINUX_IMAGE` | Guest kernel image | `$LINUX_BUILD/arch/riscv/boot/Image` |
+| `CROSS_COMPILE` | RISC-V cross compiler prefix | `riscv64-linux-gnu-` |
+| `VIRT_LLM_MODEL_PATH` | Qwen safetensors file used by `MODEL_LOAD` | `/home/zyz/llmsim/models/qwen2.5-0.5b-instruct/model.safetensors` |
+| `VIRT_LLM_ARTIFACT_DIR` | Generated initramfs and helper artifacts | `$QEMU_BUILD/virt-llm-artifacts` |
+| `VIRT_LLM_LOG_DIR` | QEMU validation logs | `$VIRT_LLM_ARTIFACT_DIR/logs` |
+
+Use `tools/virt_llm/env.example` as a starting point. The QEMU device also exposes the model path directly as a device property:
+
+```bash
+-device virt-llm,model-path=/path/to/qwen2.5-0.5b-instruct/model.safetensors
+```
+
+### Portable Entry Points
+
+The repository now carries the helper entry points that were previously only present in the Windows-side working directory:
+
+```bash
+/home/qemu/qemu/tools/virt_llm/build_linux_6_12_rv32.sh
+/home/qemu/qemu/tools/virt_llm/build_initramfs.sh --mode test|console|qwen
+/home/qemu/qemu/tools/virt_llm/run_virt_llm_validation.sh
+/home/qemu/qemu/tools/virt_llm/run_virt_llm_console.sh
+/home/qemu/qemu/tools/virt_llm/run_virt_llm_qwen.sh
+```
+
+The validation and Qwen scripts generate their initramfs inputs before booting, check required binaries and files up front, and write logs under `VIRT_LLM_LOG_DIR`.
+
+### Remaining Local Inputs
+
+The Qwen model file is intentionally not checked into GitHub. Clone users must provide a compatible local safetensors file and set `VIRT_LLM_MODEL_PATH` or pass the `model-path` device property. QEMU build directories are also not portable; after cloning, run QEMU configure/build again instead of reusing an existing `build/pyvenv`.
