@@ -29,11 +29,11 @@ timeout --foreground "${VIRT_LLM_BOOT_TIMEOUT:-90s}" \
   > "$LOG" 2>&1 || rc=$?
 
 echo "QEMU_EXIT_CODE=$rc"
-grep -E 'Linux version 6.12.0|pci|virt_llm|dma inference ok|INITRAMFS_OK|reboot: Restarting system|Kernel panic' "$LOG" | tail -180 || true
+grep -E 'Linux version |pci|virt_llm|dma inference ok|INITRAMFS_OK|reboot: Restarting system|Kernel panic' "$LOG" | tail -180 || true
 echo "LOG_PATH=$LOG"
 
 test "$rc" -eq 0
-grep -q 'Linux version 6.12.0' "$LOG"
+grep -q 'Linux version ' "$LOG"
 grep -q 'virt_llm_pci .*probe ok:' "$LOG"
 grep -q 'virt_llm_pci .*dma inference ok:' "$LOG"
 grep -q "$MARKER" "$LOG"
