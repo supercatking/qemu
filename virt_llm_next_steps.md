@@ -217,22 +217,41 @@ virt_llm_pci ... error path ok: desc_status=0x80000002 q_status=0x00000003 q_err
 INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 ```
 
+## Implemented in the Completion Queue Step
+
+This step added the first real completion queue path:
+
+- Added CQ registers: base address, size, guest head, and device tail.
+- Added a compact CQ entry with command id, opcode, backend, status, result,
+  and queue head snapshot.
+- Kept inline descriptor status for compatibility.
+- Updated Linux validation to program a CQ and verify every command completion
+  by command id.
+
+Validation result:
+
+```text
+virt_llm_pci ... dma buffers: queue=... cq=... input=... output=...
+virt_llm_pci ... dma inference ok: ...
+virt_llm_pci ... dma copy ok: ...
+virt_llm_pci ... vector add ok: ...
+virt_llm_pci ... gemm ok: ...
+virt_llm_pci ... error path ok: ...
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
+
 ## Immediate Next Coding Step
 
-The best next coding step is to add a real completion queue:
+The best next coding step is to add the remaining RISC-V vector-style kernels:
 
-1. Add CQ base/size/head/tail registers.
-2. Define a compact completion entry with command id, opcode, backend, status,
-   and result.
-3. Preserve inline descriptor status for compatibility while making Linux
-   consume CQ entries.
-4. Validate that the driver can submit several commands and receive completions
-   by command id.
+1. Add `SOFTMAX_Q16` as a deterministic fixed-point vector backend command.
+2. Add `POOL_MAX_U32` as a deterministic vector backend command.
+3. Extend Linux validation with small known-answer tests.
+4. Keep all completions flowing through the CQ.
 5. Re-run the riscv32 Linux 6.12 boot validation.
 
-This is the next important step because your target architecture says every
-operation eventually writes a CQ entry. Once CQ exists, softmax/pooling and
-more complex tensor commands can be added without changing completion behavior.
+This builds out the vector-processor side of the accelerator now that command
+dispatch and completion reporting are stable.
 
 ## Implementation Phases for the LLM Accelerator Shape
 
