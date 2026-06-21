@@ -257,28 +257,37 @@ virt_llm_pci ... pool max ok: count=8 window=2 checksum=0x00000018
 INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 ```
 
+## Implemented in the Scalar Dot Product Step
+
+This step completed Phase 2 of the RISC-V32 scalar dispatcher plan:
+
+- Added scalar-dispatched opcode `DOT_U32`.
+- Added kernel id `2` for `dot_u32`.
+- Kept the operation in the scalar-to-vector execution path.
+- Extended Linux validation with a known-answer dot product test.
+
+Validation result:
+
+```text
+virt_llm_pci ... dot u32 ok: count=4 result=70
+virt_llm_pci ... probe ok: ... scalar_kernels=5 ...
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
+
 ## Immediate Next Coding Step
 
-The queue/CQ batch validation step has been implemented locally in the Linux
-6.12 driver:
+The next coding step is Phase 3 of the hardware plan:
 
-- four DMA descriptors are submitted with one kick;
-- SQ index wraps through the 4-entry ring;
-- CQ entries are checked across the CQ ring;
-- validation passed with `batch wrap ok: q_head=6->10 cq_tail=6->10`.
-
-The next coding step is Phase 1 of the RISC-V32 scalar dispatcher:
-
-1. Add scalar dispatcher state and capability registers.
-2. Add feature bit for scalar dispatch.
-3. Route vector opcodes through `virt_llm_scalar_dispatch()`.
-4. Make CQ report backend `SCALAR` for scalar-routed vector commands.
-5. Update Linux validation to set kernel ids and verify scalar backend CQ
-   entries.
+1. Add tensor-core opcode `CONV2D_U32`.
+2. Route it directly to the tensor core backend, not through scalar dispatch.
+3. Pack input width/height, kernel width/height, and output dimensions into
+   descriptor arguments.
+4. Add a tiny known-answer convolution test in the Linux driver.
+5. Keep CQ completion validation for the tensor backend.
 6. Re-run the riscv32 Linux 6.12 boot validation.
 
-This introduces the control-plane split needed for kernel dispatch without
-attempting to execute arbitrary uploaded RISC-V32 code in the same step.
+This exercises the split between scalar-dispatched vector kernels and direct
+tensor-core kernels.
 
 ## Implementation Phases for the LLM Accelerator Shape
 
