@@ -23,6 +23,25 @@ card so future model-runtime work has stable hardware semantics to build on.
 
 ## Proposed Work Phases
 
+### Phase 0: Command-Dispatcher Architecture Document
+
+This phase captures the target architecture requested for the LLM PCIe
+accelerator:
+
+- command queue front end parses and dispatches commands;
+- simple DMA commands execute directly in a DMA engine;
+- vector operations such as vector add, softmax, and pooling dispatch to a
+  simulated RISC-V vector processor backend;
+- GEMM and future tensor kernels dispatch to a simulated tensor core backend;
+- every command eventually writes a completion entry and raises an interrupt.
+
+Acceptance:
+
+- Architecture document explains command queue, backend dispatch, opcode
+  ranges, descriptor arguments, and completion policy.
+- Implementation phases are small enough that each one can be committed and
+  reverted independently.
+
 ### Phase 1: ABI Cleanup and Versioning
 
 Add a clearer device ABI boundary before growing the feature set.
@@ -175,18 +194,105 @@ INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 
 ## Immediate Next Coding Step
 
-The best next coding step after this is the next queue-model slice:
+The best next coding step after this architecture update is a small dispatcher
+slice:
 
-1. Add ring wrap-around validation with multiple descriptors.
-2. Add a device-owned completion flag or generation bit to make ownership fully
-   bidirectional.
-3. Add queue-full and tail-range validation.
-4. Add separate error codes for invalid queue address, invalid queue size,
-   descriptor not ready, bad length, and unsupported opcode.
-5. Re-run the riscv32 Linux 6.12 boot validation.
+1. Add a QEMU command dispatcher function that maps opcode to backend.
+2. Keep existing `INFER_XOR` behavior as the compatibility command.
+3. Add `DMA_COPY` as the first DMA-engine opcode.
+4. Add `VECTOR_ADD_U32` as the first RISC-V vector backend opcode.
+5. Add `GEMM_U32` as the first tensor-core backend opcode.
+6. Update the Linux validation driver to submit one descriptor per backend.
+7. Re-run the riscv32 Linux 6.12 boot validation.
 
-This keeps the next patch small enough to review while making the ABI much more
-solid for later userspace and simulated inference work.
+This creates the hardware shape you described while keeping each operation
+deterministic and small enough to debug from kernel logs.
+
+## Implementation Phases for the LLM Accelerator Shape
+
+### Implementation Phase A: Dispatcher and Backend Stubs
+
+QEMU:
+
+- Add backend ids for compatibility, DMA, vector, and tensor.
+- Add a central `virt_llm_dispatch_desc()` function.
+- Refactor existing XOR inference command into the compatibility backend.
+- Add lightweight debug logs for opcode, backend, status, and result.
+
+Linux:
+
+- Keep current validation unchanged.
+
+Commit boundary:
+
+- One QEMU-only commit.
+
+### Implementation Phase B: DMA Engine Command
+
+QEMU:
+
+- Add opcode `DMA_COPY`.
+- Read `len` bytes from `input_addr`, write to `output_addr`, return checksum.
+
+Linux:
+
+- Submit a DMA copy descriptor and verify output bytes/checksum.
+
+Commit boundary:
+
+- One QEMU commit and one Linux driver commit after validation.
+
+### Implementation Phase C: RISC-V Vector Backend
+
+QEMU:
+
+- Add opcode `VECTOR_ADD_U32`.
+- Treat `input_addr` and `rsvd1` as two u32 arrays.
+- Treat `len` as element count.
+- Write u32 output to `output_addr`.
+
+Linux:
+
+- Allocate a second input buffer.
+- Submit vector add and verify output/checksum.
+
+Commit boundary:
+
+- One QEMU commit and one Linux driver commit after validation.
+
+### Implementation Phase D: Tensor Core Backend
+
+QEMU:
+
+- Add opcode `GEMM_U32`.
+- Treat `input_addr` as matrix A, `rsvd1` as matrix B, `output_addr` as C.
+- Pack dimensions into `rsvd2`: low 16 bits M, next 16 bits N, next 16 bits K.
+- Keep matrix sizes small for validation.
+
+Linux:
+
+- Submit a small GEMM, for example 2x2 times 2x2, and verify output.
+
+Commit boundary:
+
+- One QEMU commit and one Linux driver commit after validation.
+
+### Implementation Phase E: Completion Queue
+
+QEMU:
+
+- Add CQ base/size/head/tail registers.
+- Write completion entries rather than relying only on inline descriptor status.
+- Preserve inline status temporarily for compatibility.
+
+Linux:
+
+- Allocate and program CQ.
+- Consume completions by command id.
+
+Commit boundary:
+
+- One ABI-breaking or ABI-extending QEMU/Linux pair after validation.
 
 ## Review Questions
 
