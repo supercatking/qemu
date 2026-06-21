@@ -761,7 +761,7 @@ static uint32_t virt_llm_process_attention_q16(VirtLLMState *s,
 
                 acc += (qv * kv) >> 16;
             }
-            scores[col] = acc / head_dim;
+            scores[col] = acc;
             if (col == 0 || scores[col] > max_score) {
                 max_score = scores[col];
             }
