@@ -139,6 +139,8 @@ Acceptance:
 
 ### Step 4.2: QEMU Kernel Table Metadata
 
+Status: implemented and validated.
+
 QEMU:
 
 - Add a static built-in kernel metadata table.
@@ -157,6 +159,14 @@ Validation:
 - QEMU build passes.
 - Linux 6.12 build passes.
 - Boot log prints `kernel table ok`.
+
+Validation result:
+
+```text
+virt_llm_pci ... kernel table ok: kernels=4 abi=1 first_entry=0x00001000 last_entry=0x00001300
+virt_llm_pci ... probe ok: ... scalar_kernels=4 ...
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
 
 Commit boundary:
 

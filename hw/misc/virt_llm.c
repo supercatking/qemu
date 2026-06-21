@@ -48,6 +48,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_REG_SCALAR_KERNELS 0x68
 #define VIRT_LLM_REG_SCALAR_LAST_KERNEL 0x6c
 #define VIRT_LLM_REG_SCALAR_LAST_OPCODE 0x70
+#define VIRT_LLM_REG_KERNEL_INDEX 0x74
+#define VIRT_LLM_REG_KERNEL_ID 0x78
+#define VIRT_LLM_REG_KERNEL_OPCODE 0x7c
+#define VIRT_LLM_REG_KERNEL_ABI 0x80
+#define VIRT_LLM_REG_KERNEL_ENTRY 0x84
+#define VIRT_LLM_REG_KERNEL_SIZE 0x88
+#define VIRT_LLM_REG_KERNEL_CHECKSUM 0x8c
 
 #define VIRT_LLM_MAGIC        0x4c4c4d31u /* "LLM1" */
 #define VIRT_LLM_VERSION      3u
@@ -100,7 +107,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_SCALAR_IDLE    0u
 #define VIRT_LLM_SCALAR_RUNNING 1u
 #define VIRT_LLM_SCALAR_ERROR   2u
-#define VIRT_LLM_SCALAR_KERNELS 5u
+#define VIRT_LLM_KERNEL_ABI_VERSION 1u
 #define VIRT_LLM_KERNEL_VEC_ADD_U32 1u
 #define VIRT_LLM_KERNEL_DOT_U32 2u
 #define VIRT_LLM_KERNEL_SOFTMAX_Q16 3u
@@ -130,6 +137,55 @@ typedef struct VirtLLMCpl {
     uint64_t rsvd0;
 } QEMU_PACKED VirtLLMCpl;
 
+typedef struct VirtLLMKernelMeta {
+    uint32_t kernel_id;
+    uint32_t abi_version;
+    uint32_t opcode;
+    uint32_t entry_point;
+    uint32_t binary_size;
+    uint32_t binary_checksum;
+    const char *name;
+} VirtLLMKernelMeta;
+
+static const VirtLLMKernelMeta virt_llm_kernels[] = {
+    {
+        .kernel_id = VIRT_LLM_KERNEL_VEC_ADD_U32,
+        .abi_version = VIRT_LLM_KERNEL_ABI_VERSION,
+        .opcode = VIRT_LLM_OP_VEC_ADD_U32,
+        .entry_point = 0x1000,
+        .binary_size = 64,
+        .binary_checksum = 0xadd00101,
+        .name = "vec_add_u32",
+    },
+    {
+        .kernel_id = VIRT_LLM_KERNEL_DOT_U32,
+        .abi_version = VIRT_LLM_KERNEL_ABI_VERSION,
+        .opcode = VIRT_LLM_OP_DOT_U32,
+        .entry_point = 0x1100,
+        .binary_size = 72,
+        .binary_checksum = 0xd0700103,
+        .name = "dot_u32",
+    },
+    {
+        .kernel_id = VIRT_LLM_KERNEL_SOFTMAX_Q16,
+        .abi_version = VIRT_LLM_KERNEL_ABI_VERSION,
+        .opcode = VIRT_LLM_OP_SOFTMAX_Q16,
+        .entry_point = 0x1200,
+        .binary_size = 96,
+        .binary_checksum = 0x50170101,
+        .name = "softmax_q16",
+    },
+    {
+        .kernel_id = VIRT_LLM_KERNEL_POOL_MAX_U32,
+        .abi_version = VIRT_LLM_KERNEL_ABI_VERSION,
+        .opcode = VIRT_LLM_OP_POOL_MAX_U32,
+        .entry_point = 0x1300,
+        .binary_size = 80,
+        .binary_checksum = 0x90010102,
+        .name = "pool_max_u32",
+    },
+};
+
 struct VirtLLMState {
     PCIDevice parent_obj;
     MemoryRegion mmio;
@@ -150,7 +206,17 @@ struct VirtLLMState {
     uint32_t scalar_status;
     uint32_t scalar_last_kernel;
     uint32_t scalar_last_opcode;
+    uint32_t kernel_index;
 };
+
+static const VirtLLMKernelMeta *virt_llm_selected_kernel(VirtLLMState *s)
+{
+    if (s->kernel_index >= ARRAY_SIZE(virt_llm_kernels)) {
+        return NULL;
+    }
+
+    return &virt_llm_kernels[s->kernel_index];
+}
 
 static void virt_llm_raise_irq(VirtLLMState *s, uint32_t cause)
 {
@@ -227,6 +293,7 @@ static void virt_llm_queue_reset(VirtLLMState *s)
     s->cq_size = 0;
     s->cq_head = 0;
     s->cq_tail = 0;
+    s->kernel_index = 0;
 }
 
 static bool virt_llm_queue_config_valid(VirtLLMState *s)
@@ -732,11 +799,31 @@ static uint64_t virt_llm_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case VIRT_LLM_REG_SCALAR_STATUS:
         return s->scalar_status;
     case VIRT_LLM_REG_SCALAR_KERNELS:
-        return VIRT_LLM_SCALAR_KERNELS;
+        return ARRAY_SIZE(virt_llm_kernels);
     case VIRT_LLM_REG_SCALAR_LAST_KERNEL:
         return s->scalar_last_kernel;
     case VIRT_LLM_REG_SCALAR_LAST_OPCODE:
         return s->scalar_last_opcode;
+    case VIRT_LLM_REG_KERNEL_INDEX:
+        return s->kernel_index;
+    case VIRT_LLM_REG_KERNEL_ID:
+        return virt_llm_selected_kernel(s) ?
+               virt_llm_selected_kernel(s)->kernel_id : 0;
+    case VIRT_LLM_REG_KERNEL_OPCODE:
+        return virt_llm_selected_kernel(s) ?
+               virt_llm_selected_kernel(s)->opcode : 0;
+    case VIRT_LLM_REG_KERNEL_ABI:
+        return virt_llm_selected_kernel(s) ?
+               virt_llm_selected_kernel(s)->abi_version : 0;
+    case VIRT_LLM_REG_KERNEL_ENTRY:
+        return virt_llm_selected_kernel(s) ?
+               virt_llm_selected_kernel(s)->entry_point : 0;
+    case VIRT_LLM_REG_KERNEL_SIZE:
+        return virt_llm_selected_kernel(s) ?
+               virt_llm_selected_kernel(s)->binary_size : 0;
+    case VIRT_LLM_REG_KERNEL_CHECKSUM:
+        return virt_llm_selected_kernel(s) ?
+               virt_llm_selected_kernel(s)->binary_checksum : 0;
     default:
         return 0;
     }
@@ -815,6 +902,17 @@ static void virt_llm_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case VIRT_LLM_REG_CQ_HEAD:
         s->cq_head = val;
+        break;
+    case VIRT_LLM_REG_KERNEL_INDEX:
+        s->kernel_index = val;
+        if (virt_llm_selected_kernel(s)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "virt-llm: selected kernel index=%u id=%u opcode=0x%04x abi=%u\n",
+                          s->kernel_index,
+                          virt_llm_selected_kernel(s)->kernel_id,
+                          virt_llm_selected_kernel(s)->opcode,
+                          virt_llm_selected_kernel(s)->abi_version);
+        }
         break;
     default:
         break;

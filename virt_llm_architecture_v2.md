@@ -228,7 +228,7 @@ Every architecture step should keep the same validation rhythm:
 
 ## Proposed Next Milestone
 
-The next implementation milestone should be narrow:
+The first Architecture V2 implementation milestone is complete:
 
 1. Add the QEMU kernel metadata table.
 2. Add kernel metadata registers.
@@ -236,5 +236,11 @@ The next implementation milestone should be narrow:
 4. Do not enforce ABI mismatch yet.
 5. Validate boot.
 
-Once that is stable, the following milestone can enforce kernel ABI validation
-and add negative tests.
+Validation passed with:
+
+```text
+virt_llm_pci ... kernel table ok: kernels=4 abi=1 first_entry=0x00001000 last_entry=0x00001300
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
+
+The next milestone can enforce kernel ABI validation and add negative tests.
