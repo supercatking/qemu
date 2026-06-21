@@ -66,6 +66,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_OP_INFER_XOR  0x0001
 #define VIRT_LLM_OP_DMA_COPY   0x0010
 #define VIRT_LLM_OP_VEC_ADD_U32 0x0100
+#define VIRT_LLM_OP_SOFTMAX_Q16 0x0101
+#define VIRT_LLM_OP_POOL_MAX_U32 0x0102
 #define VIRT_LLM_OP_GEMM_U32   0x0200
 #define VIRT_LLM_DESC_F_READY  BIT(0)
 #define VIRT_LLM_DESC_COMPLETE 1
@@ -308,6 +310,94 @@ static uint32_t virt_llm_process_vec_add_u32(VirtLLMState *s,
     return VIRT_LLM_DESC_COMPLETE;
 }
 
+static uint32_t virt_llm_process_softmax_q16(VirtLLMState *s,
+                                             VirtLLMDesc *desc)
+{
+    g_autofree uint32_t *input = NULL;
+    g_autofree uint32_t *output = NULL;
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+    uint32_t count = le32_to_cpu(desc->len);
+    uint64_t sum = 0;
+    uint32_t checksum = 0;
+    size_t bytes;
+
+    if (!input_addr || !output_addr || count == 0 ||
+        count > VIRT_LLM_MAX_XFER / sizeof(uint32_t)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    bytes = count * sizeof(uint32_t);
+    input = g_malloc(bytes);
+    output = g_malloc(bytes);
+    pci_dma_read(PCI_DEVICE(s), input_addr, input, bytes);
+
+    for (uint32_t i = 0; i < count; i++) {
+        sum += le32_to_cpu(input[i]);
+    }
+    if (!sum) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t q16 = (le32_to_cpu(input[i]) << 16) / sum;
+
+        output[i] = cpu_to_le32(q16);
+        checksum += q16;
+    }
+
+    pci_dma_write(PCI_DEVICE(s), output_addr, output, bytes);
+    desc->result = cpu_to_le32(checksum);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_pool_max_u32(VirtLLMState *s,
+                                              VirtLLMDesc *desc)
+{
+    g_autofree uint32_t *input = NULL;
+    g_autofree uint32_t *output = NULL;
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+    uint64_t args = le64_to_cpu(desc->rsvd2);
+    uint32_t count = le32_to_cpu(desc->len);
+    uint32_t window = extract64(args, 0, 16);
+    uint32_t out_count;
+    uint32_t checksum = 0;
+    size_t input_bytes;
+    size_t output_bytes;
+
+    if (!input_addr || !output_addr || count == 0 || window == 0 ||
+        count % window ||
+        count > VIRT_LLM_MAX_XFER / sizeof(uint32_t)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    out_count = count / window;
+    input_bytes = count * sizeof(uint32_t);
+    output_bytes = out_count * sizeof(uint32_t);
+    input = g_malloc(input_bytes);
+    output = g_malloc(output_bytes);
+    pci_dma_read(PCI_DEVICE(s), input_addr, input, input_bytes);
+
+    for (uint32_t o = 0; o < out_count; o++) {
+        uint32_t max = 0;
+
+        for (uint32_t i = 0; i < window; i++) {
+            uint32_t v = le32_to_cpu(input[o * window + i]);
+
+            if (i == 0 || v > max) {
+                max = v;
+            }
+        }
+        output[o] = cpu_to_le32(max);
+        checksum += max;
+    }
+
+    pci_dma_write(PCI_DEVICE(s), output_addr, output, output_bytes);
+    desc->result = cpu_to_le32(checksum);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
 static uint32_t virt_llm_process_gemm_u32(VirtLLMState *s, VirtLLMDesc *desc)
 {
     g_autofree uint32_t *a = NULL;
@@ -369,6 +459,12 @@ static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
     case VIRT_LLM_OP_VEC_ADD_U32:
         *backend = VIRT_LLM_BACKEND_VECTOR;
         return virt_llm_process_vec_add_u32(s, desc);
+    case VIRT_LLM_OP_SOFTMAX_Q16:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_softmax_q16(s, desc);
+    case VIRT_LLM_OP_POOL_MAX_U32:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_pool_max_u32(s, desc);
     case VIRT_LLM_OP_GEMM_U32:
         *backend = VIRT_LLM_BACKEND_TENSOR;
         return virt_llm_process_gemm_u32(s, desc);
