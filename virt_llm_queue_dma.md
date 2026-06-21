@@ -38,7 +38,7 @@ All registers are little-endian 32-bit. BAR0 remains 4 KiB.
 | Offset | Name | Access | Description |
 | --- | --- | --- | --- |
 | `0x00` | MAGIC | RO | `0x4c4c4d31` (`LLM1`) |
-| `0x04` | VERSION | RO | Device version, now `2` |
+| `0x04` | VERSION | RO | Device version, now `3` |
 | `0x08` | DOORBELL | RW | Legacy self-test doorbell |
 | `0x0c` | STATUS | RO | Legacy self-test status |
 | `0x10` | FEATURES | RO | Feature bits |
@@ -50,16 +50,25 @@ All registers are little-endian 32-bit. BAR0 remains 4 KiB.
 | `0x28` | IRQ_STATUS | RW1C | Completion interrupt status bit |
 | `0x2c` | IRQ_MASK | RW | Interrupt enable mask |
 | `0x30` | COMMAND | WO | Explicit command/kick register |
+| `0x34` | ABI | RO | ABI version, currently `1` |
+| `0x38` | QUEUE_MAX | RO | Maximum supported queue depth |
+| `0x3c` | XFER_MAX | RO | Maximum transfer length |
+| `0x40` | IRQ_VEC | RO | Number of interrupt vectors |
+| `0x44` | QUEUE_CTRL | RW | Queue enable/reset control |
+| `0x48` | QUEUE_STATUS | RO | Queue enabled/error status |
+| `0x4c` | QUEUE_ERROR | RO | Last queue error code |
 
 Feature bits:
 
 - Bit 0: DMA queue supported.
 - Bit 1: MSI supported.
 - Bit 2: MSI-X supported.
+- Bit 3: Queue control/status/error registers supported.
 
 Interrupt bits:
 
 - Bit 0: descriptor completion.
+- Bit 1: descriptor or queue error.
 
 Command values:
 
@@ -94,6 +103,8 @@ Status values:
 - `0`: free/submitted but not complete.
 - `1`: complete.
 - `0x80000001`: invalid descriptor.
+- `0x80000002`: unsupported opcode.
+- `0x80000003`: invalid transfer length or DMA buffer address.
 
 Result:
 
