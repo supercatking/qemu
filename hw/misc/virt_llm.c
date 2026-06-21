@@ -44,6 +44,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_REG_CQ_HI    0x58
 #define VIRT_LLM_REG_CQ_HEAD  0x5c
 #define VIRT_LLM_REG_CQ_TAIL  0x60
+#define VIRT_LLM_REG_SCALAR_STATUS 0x64
+#define VIRT_LLM_REG_SCALAR_KERNELS 0x68
+#define VIRT_LLM_REG_SCALAR_LAST_KERNEL 0x6c
+#define VIRT_LLM_REG_SCALAR_LAST_OPCODE 0x70
 
 #define VIRT_LLM_MAGIC        0x4c4c4d31u /* "LLM1" */
 #define VIRT_LLM_VERSION      3u
@@ -58,6 +62,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_FEATURE_MSIX  BIT(2)
 #define VIRT_LLM_FEATURE_QCTRL BIT(3)
 #define VIRT_LLM_FEATURE_CQ    BIT(4)
+#define VIRT_LLM_FEATURE_SCALAR BIT(5)
 
 #define VIRT_LLM_IRQ_COMPLETE  BIT(0)
 #define VIRT_LLM_IRQ_ERROR     BIT(1)
@@ -88,6 +93,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_BACKEND_DMA    1u
 #define VIRT_LLM_BACKEND_VECTOR 2u
 #define VIRT_LLM_BACKEND_TENSOR 3u
+#define VIRT_LLM_BACKEND_SCALAR 4u
+
+#define VIRT_LLM_SCALAR_IDLE    0u
+#define VIRT_LLM_SCALAR_RUNNING 1u
+#define VIRT_LLM_SCALAR_ERROR   2u
+#define VIRT_LLM_SCALAR_KERNELS 4u
+#define VIRT_LLM_KERNEL_VEC_ADD_U32 1u
+#define VIRT_LLM_KERNEL_SOFTMAX_Q16 3u
+#define VIRT_LLM_KERNEL_POOL_MAX_U32 4u
 
 typedef struct VirtLLMDesc {
     uint32_t opcode;
@@ -130,6 +144,9 @@ struct VirtLLMState {
     uint32_t cq_size;
     uint32_t cq_head;
     uint32_t cq_tail;
+    uint32_t scalar_status;
+    uint32_t scalar_last_kernel;
+    uint32_t scalar_last_opcode;
 };
 
 static void virt_llm_raise_irq(VirtLLMState *s, uint32_t cause)
@@ -398,6 +415,44 @@ static uint32_t virt_llm_process_pool_max_u32(VirtLLMState *s,
     return VIRT_LLM_DESC_COMPLETE;
 }
 
+static uint32_t virt_llm_kernel_id(VirtLLMDesc *desc)
+{
+    return extract32(le64_to_cpu(desc->rsvd3), 0, 16);
+}
+
+static uint32_t virt_llm_scalar_dispatch(VirtLLMState *s, VirtLLMDesc *desc,
+                                         uint32_t opcode)
+{
+    uint32_t kernel_id = virt_llm_kernel_id(desc);
+    uint32_t status;
+
+    s->scalar_status = VIRT_LLM_SCALAR_RUNNING;
+    s->scalar_last_kernel = kernel_id;
+    s->scalar_last_opcode = opcode;
+
+    switch (opcode) {
+    case VIRT_LLM_OP_VEC_ADD_U32:
+        status = kernel_id == VIRT_LLM_KERNEL_VEC_ADD_U32 ?
+                 virt_llm_process_vec_add_u32(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        break;
+    case VIRT_LLM_OP_SOFTMAX_Q16:
+        status = kernel_id == VIRT_LLM_KERNEL_SOFTMAX_Q16 ?
+                 virt_llm_process_softmax_q16(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        break;
+    case VIRT_LLM_OP_POOL_MAX_U32:
+        status = kernel_id == VIRT_LLM_KERNEL_POOL_MAX_U32 ?
+                 virt_llm_process_pool_max_u32(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        break;
+    default:
+        status = VIRT_LLM_DESC_UNSUPP;
+        break;
+    }
+
+    s->scalar_status = status == VIRT_LLM_DESC_COMPLETE ?
+                       VIRT_LLM_SCALAR_IDLE : VIRT_LLM_SCALAR_ERROR;
+    return status;
+}
+
 static uint32_t virt_llm_process_gemm_u32(VirtLLMState *s, VirtLLMDesc *desc)
 {
     g_autofree uint32_t *a = NULL;
@@ -457,14 +512,10 @@ static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
         *backend = VIRT_LLM_BACKEND_DMA;
         return virt_llm_process_dma_copy(s, desc);
     case VIRT_LLM_OP_VEC_ADD_U32:
-        *backend = VIRT_LLM_BACKEND_VECTOR;
-        return virt_llm_process_vec_add_u32(s, desc);
     case VIRT_LLM_OP_SOFTMAX_Q16:
-        *backend = VIRT_LLM_BACKEND_VECTOR;
-        return virt_llm_process_softmax_q16(s, desc);
     case VIRT_LLM_OP_POOL_MAX_U32:
-        *backend = VIRT_LLM_BACKEND_VECTOR;
-        return virt_llm_process_pool_max_u32(s, desc);
+        *backend = VIRT_LLM_BACKEND_SCALAR;
+        return virt_llm_scalar_dispatch(s, desc, opcode);
     case VIRT_LLM_OP_GEMM_U32:
         *backend = VIRT_LLM_BACKEND_TENSOR;
         return virt_llm_process_gemm_u32(s, desc);
@@ -537,7 +588,7 @@ static uint64_t virt_llm_mmio_read(void *opaque, hwaddr addr, unsigned size)
     case VIRT_LLM_REG_FEATURES:
         return VIRT_LLM_FEATURE_QUEUE | VIRT_LLM_FEATURE_MSI |
                VIRT_LLM_FEATURE_MSIX | VIRT_LLM_FEATURE_QCTRL |
-               VIRT_LLM_FEATURE_CQ;
+               VIRT_LLM_FEATURE_CQ | VIRT_LLM_FEATURE_SCALAR;
     case VIRT_LLM_REG_Q_SIZE:
         return s->queue_size;
     case VIRT_LLM_REG_Q_LO:
@@ -576,6 +627,14 @@ static uint64_t virt_llm_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return s->cq_head;
     case VIRT_LLM_REG_CQ_TAIL:
         return s->cq_tail;
+    case VIRT_LLM_REG_SCALAR_STATUS:
+        return s->scalar_status;
+    case VIRT_LLM_REG_SCALAR_KERNELS:
+        return VIRT_LLM_SCALAR_KERNELS;
+    case VIRT_LLM_REG_SCALAR_LAST_KERNEL:
+        return s->scalar_last_kernel;
+    case VIRT_LLM_REG_SCALAR_LAST_OPCODE:
+        return s->scalar_last_opcode;
     default:
         return 0;
     }
@@ -711,6 +770,9 @@ static void virt_llm_reset(DeviceState *dev)
     virt_llm_queue_reset(s);
     s->irq_status = 0;
     s->irq_mask = 0;
+    s->scalar_status = VIRT_LLM_SCALAR_IDLE;
+    s->scalar_last_kernel = 0;
+    s->scalar_last_opcode = 0;
     pci_set_irq(PCI_DEVICE(s), 0);
     msi_reset(PCI_DEVICE(s));
     msix_reset(PCI_DEVICE(s));
