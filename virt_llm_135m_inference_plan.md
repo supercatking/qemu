@@ -106,7 +106,7 @@ Manual validation is available through a separate console initramfs. It does not
 replace or modify the automated `/home/qemu/initramfs.cpio` path.
 
 ```bash
-cd /mnt/c/Users/Admin/Documents/Codex/qemu
+cd $QEMU_SRC
 ./run_virt_llm_console.sh
 ```
 

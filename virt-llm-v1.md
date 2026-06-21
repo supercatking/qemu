@@ -524,9 +524,9 @@ Responsibilities:
 Locations:
 
 ```text
-/mnt/c/Users/Admin/Documents/Codex/qemu/run_virt_llm_validation.sh
+$QEMU_SRC/run_virt_llm_validation.sh
 /home/qemu/qemu/tools/virt_llm/run_virt_llm_qwen.sh
-/mnt/c/Users/Admin/Documents/Codex/qemu/run_virt_llm_qwen.sh
+$QEMU_SRC/run_virt_llm_qwen.sh
 ```
 
 Responsibilities:
@@ -558,7 +558,7 @@ make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- \
 From WSL:
 
 ```bash
-cd /mnt/c/Users/Admin/Documents/Codex/qemu
+cd $QEMU_SRC
 ./run_virt_llm_validation.sh
 ```
 
