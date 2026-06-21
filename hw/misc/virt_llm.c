@@ -132,6 +132,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_TENSOR_ABI_VERSION 1u
 #define VIRT_LLM_DTYPE_U32 1u
 #define VIRT_LLM_DTYPE_F32 2u
+#define VIRT_LLM_DTYPE_BF16 3u
 #define VIRT_LLM_TENSOR_F_CAUSAL BIT(0)
 #define VIRT_LLM_QWEN_LAYERS 24u
 #define VIRT_LLM_QWEN_HIDDEN 896u
@@ -140,6 +141,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_QWEN_HEAD_DIM 64u
 #define VIRT_LLM_QWEN_INTERMEDIATE 4864u
 #define VIRT_LLM_QWEN_VOCAB 151936u
+#define VIRT_LLM_QWEN_TENSORS (2u + VIRT_LLM_QWEN_LAYERS * 9u)
+#define VIRT_LLM_SAFETENSORS_PATH \
+    "/home/zyz/llmsim/models/qwen2.5-0.5b-instruct/model.safetensors"
+#define VIRT_LLM_SAFETENSORS_HEADER_MAX (16 * MiB)
+#define VIRT_LLM_TENSOR_ID_EMBED 1u
+#define VIRT_LLM_TENSOR_ID_FINAL_NORM 2u
+#define VIRT_LLM_TENSOR_ID_LAYER_BASE 1000u
+#define VIRT_LLM_TENSOR_ID_LAYER_STRIDE 16u
 
 typedef struct VirtLLMDesc {
     uint32_t opcode;
@@ -174,6 +183,16 @@ typedef struct VirtLLMKernelMeta {
     uint32_t binary_checksum;
     const char *name;
 } VirtLLMKernelMeta;
+
+typedef struct VirtLLMModelTensor {
+    uint32_t tensor_id;
+    uint32_t dtype;
+    uint32_t rank;
+    uint32_t dims[4];
+    uint64_t data_begin;
+    uint64_t data_end;
+    char name[96];
+} VirtLLMModelTensor;
 
 typedef struct VirtLLMTensorReq {
     uint32_t abi;
@@ -270,6 +289,10 @@ struct VirtLLMState {
     uint32_t scalar_last_kernel;
     uint32_t scalar_last_opcode;
     uint32_t kernel_index;
+    bool model_loaded;
+    uint32_t model_tensor_count;
+    uint32_t model_checksum;
+    VirtLLMModelTensor model_tensors[VIRT_LLM_QWEN_TENSORS];
 };
 
 static const VirtLLMKernelMeta *virt_llm_selected_kernel(VirtLLMState *s)
@@ -920,10 +943,393 @@ static uint32_t virt_llm_process_attention_q16(VirtLLMState *s,
     return VIRT_LLM_DESC_COMPLETE;
 }
 
+static uint32_t virt_llm_model_checksum_mix(uint32_t checksum, uint64_t value)
+{
+    checksum ^= (uint32_t)value;
+    checksum *= 16777619u;
+    checksum ^= (uint32_t)(value >> 32);
+    checksum *= 16777619u;
+    return checksum;
+}
+
+static const char *virt_llm_json_skip_ws(const char *p, const char *end)
+{
+    while (p < end && g_ascii_isspace(*p)) {
+        p++;
+    }
+    return p;
+}
+
+static const char *virt_llm_json_find_token(const char *json, const char *end,
+                                            const char *token)
+{
+    size_t token_len = strlen(token);
+
+    for (const char *p = json; p + token_len <= end; p++) {
+        if (!memcmp(p, token, token_len)) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static bool virt_llm_json_object_for_key(const char *json, size_t json_len,
+                                         const char *key, const char **obj,
+                                         const char **obj_end)
+{
+    g_autofree char *needle = g_strdup_printf("\"%s\"", key);
+    const char *end = json + json_len;
+    const char *p = virt_llm_json_find_token(json, end, needle);
+    bool in_string = false;
+    bool escaped = false;
+    uint32_t depth = 0;
+
+    if (!p) {
+        return false;
+    }
+    p += strlen(needle);
+    p = virt_llm_json_skip_ws(p, end);
+    if (p >= end || *p != ':') {
+        return false;
+    }
+    p = virt_llm_json_skip_ws(p + 1, end);
+    if (p >= end || *p != '{') {
+        return false;
+    }
+
+    *obj = p;
+    for (; p < end; p++) {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (*p == '\\') {
+                escaped = true;
+            } else if (*p == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (*p == '"') {
+            in_string = true;
+        } else if (*p == '{') {
+            depth++;
+        } else if (*p == '}') {
+            if (!depth) {
+                return false;
+            }
+            depth--;
+            if (!depth) {
+                *obj_end = p + 1;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool virt_llm_json_field_string(const char *obj, const char *obj_end,
+                                       const char *field, char *out,
+                                       size_t out_size)
+{
+    g_autofree char *needle = g_strdup_printf("\"%s\"", field);
+    const char *p = virt_llm_json_find_token(obj, obj_end, needle);
+    const char *start;
+    size_t len;
+
+    if (!p || out_size == 0) {
+        return false;
+    }
+    p += strlen(needle);
+    p = virt_llm_json_skip_ws(p, obj_end);
+    if (p >= obj_end || *p != ':') {
+        return false;
+    }
+    p = virt_llm_json_skip_ws(p + 1, obj_end);
+    if (p >= obj_end || *p != '"') {
+        return false;
+    }
+    start = ++p;
+    while (p < obj_end && *p != '"') {
+        if (*p == '\\') {
+            return false;
+        }
+        p++;
+    }
+    if (p >= obj_end) {
+        return false;
+    }
+    len = p - start;
+    if (len >= out_size) {
+        return false;
+    }
+    memcpy(out, start, len);
+    out[len] = 0;
+    return true;
+}
+
+static bool virt_llm_json_parse_u64(const char **p, const char *end,
+                                    uint64_t *value)
+{
+    uint64_t v = 0;
+    bool any = false;
+
+    *p = virt_llm_json_skip_ws(*p, end);
+    while (*p < end && g_ascii_isdigit(**p)) {
+        uint32_t digit = **p - '0';
+
+        if (v > (UINT64_MAX - digit) / 10) {
+            return false;
+        }
+        v = v * 10 + digit;
+        (*p)++;
+        any = true;
+    }
+    *value = v;
+    return any;
+}
+
+static bool virt_llm_json_field_u64_array(const char *obj, const char *obj_end,
+                                          const char *field, uint64_t *values,
+                                          uint32_t max_values,
+                                          uint32_t *count)
+{
+    g_autofree char *needle = g_strdup_printf("\"%s\"", field);
+    const char *p = virt_llm_json_find_token(obj, obj_end, needle);
+    uint32_t n = 0;
+
+    if (!p) {
+        return false;
+    }
+    p += strlen(needle);
+    p = virt_llm_json_skip_ws(p, obj_end);
+    if (p >= obj_end || *p != ':') {
+        return false;
+    }
+    p = virt_llm_json_skip_ws(p + 1, obj_end);
+    if (p >= obj_end || *p != '[') {
+        return false;
+    }
+    p++;
+    for (;;) {
+        p = virt_llm_json_skip_ws(p, obj_end);
+        if (p >= obj_end) {
+            return false;
+        }
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        if (n >= max_values ||
+            !virt_llm_json_parse_u64(&p, obj_end, &values[n])) {
+            return false;
+        }
+        n++;
+        p = virt_llm_json_skip_ws(p, obj_end);
+        if (p < obj_end && *p == ',') {
+            p++;
+            continue;
+        }
+        if (p < obj_end && *p == ']') {
+            p++;
+            break;
+        }
+        return false;
+    }
+    *count = n;
+    return n > 0;
+}
+
+static uint32_t virt_llm_safetensors_dtype(const char *dtype)
+{
+    if (!g_strcmp0(dtype, "F32")) {
+        return VIRT_LLM_DTYPE_F32;
+    }
+    if (!g_strcmp0(dtype, "BF16")) {
+        return VIRT_LLM_DTYPE_BF16;
+    }
+    return 0;
+}
+
+static bool virt_llm_parse_safetensors_tensor(VirtLLMModelTensor *tensor,
+                                              const char *json,
+                                              size_t json_len,
+                                              const char *name,
+                                              uint32_t tensor_id)
+{
+    const char *obj;
+    const char *obj_end;
+    char dtype[8];
+    uint64_t shape[4] = { 0 };
+    uint64_t offsets[2] = { 0 };
+    uint32_t rank;
+    uint32_t offset_count;
+    uint32_t dtype_id;
+
+    if (!virt_llm_json_object_for_key(json, json_len, name, &obj, &obj_end) ||
+        !virt_llm_json_field_string(obj, obj_end, "dtype", dtype,
+                                    sizeof(dtype)) ||
+        !virt_llm_json_field_u64_array(obj, obj_end, "shape", shape,
+                                       ARRAY_SIZE(shape), &rank) ||
+        !virt_llm_json_field_u64_array(obj, obj_end, "data_offsets", offsets,
+                                       ARRAY_SIZE(offsets), &offset_count) ||
+        offset_count != 2 || offsets[1] < offsets[0]) {
+        return false;
+    }
+
+    dtype_id = virt_llm_safetensors_dtype(dtype);
+    if (!dtype_id) {
+        return false;
+    }
+
+    memset(tensor, 0, sizeof(*tensor));
+    tensor->tensor_id = tensor_id;
+    tensor->dtype = dtype_id;
+    tensor->rank = rank;
+    for (uint32_t i = 0; i < rank; i++) {
+        if (shape[i] > UINT32_MAX) {
+            return false;
+        }
+        tensor->dims[i] = shape[i];
+    }
+    tensor->data_begin = offsets[0];
+    tensor->data_end = offsets[1];
+    g_strlcpy(tensor->name, name, sizeof(tensor->name));
+    return true;
+}
+
+static uint32_t virt_llm_tensor_checksum(const VirtLLMModelTensor *tensor,
+                                         uint32_t checksum)
+{
+    checksum = virt_llm_model_checksum_mix(checksum, tensor->tensor_id);
+    checksum = virt_llm_model_checksum_mix(checksum, tensor->dtype);
+    checksum = virt_llm_model_checksum_mix(checksum, tensor->rank);
+    for (uint32_t i = 0; i < tensor->rank; i++) {
+        checksum = virt_llm_model_checksum_mix(checksum, tensor->dims[i]);
+    }
+    checksum = virt_llm_model_checksum_mix(checksum, tensor->data_begin);
+    checksum = virt_llm_model_checksum_mix(checksum, tensor->data_end);
+    return checksum;
+}
+
+static bool virt_llm_read_safetensors_header(char **json, size_t *json_len)
+{
+    FILE *fp;
+    uint8_t len_raw[8];
+    uint64_t header_len = 0;
+    char *buf;
+
+    fp = fopen(VIRT_LLM_SAFETENSORS_PATH, "rb");
+    if (!fp) {
+        return false;
+    }
+    if (fread(len_raw, 1, sizeof(len_raw), fp) != sizeof(len_raw)) {
+        fclose(fp);
+        return false;
+    }
+    for (uint32_t i = 0; i < sizeof(len_raw); i++) {
+        header_len |= (uint64_t)len_raw[i] << (i * 8);
+    }
+    if (!header_len || header_len > VIRT_LLM_SAFETENSORS_HEADER_MAX) {
+        fclose(fp);
+        return false;
+    }
+
+    buf = g_malloc(header_len + 1);
+    if (fread(buf, 1, header_len, fp) != header_len) {
+        g_free(buf);
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+    buf[header_len] = 0;
+    *json = buf;
+    *json_len = header_len;
+    return true;
+}
+
+static bool virt_llm_load_qwen_tensor_table(VirtLLMState *s)
+{
+    static const char * const layer_slots[] = {
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+    };
+    g_autofree char *json = NULL;
+    size_t json_len = 0;
+    uint32_t count = 0;
+    uint32_t checksum = 2166136261u;
+
+    memset(s->model_tensors, 0, sizeof(s->model_tensors));
+    s->model_loaded = false;
+    s->model_tensor_count = 0;
+    s->model_checksum = 0;
+
+    if (!virt_llm_read_safetensors_header(&json, &json_len)) {
+        return false;
+    }
+
+    if (!virt_llm_parse_safetensors_tensor(&s->model_tensors[count], json,
+                                           json_len,
+                                           "model.embed_tokens.weight",
+                                           VIRT_LLM_TENSOR_ID_EMBED)) {
+        return false;
+    }
+    checksum = virt_llm_tensor_checksum(&s->model_tensors[count], checksum);
+    count++;
+
+    if (!virt_llm_parse_safetensors_tensor(&s->model_tensors[count], json,
+                                           json_len, "model.norm.weight",
+                                           VIRT_LLM_TENSOR_ID_FINAL_NORM)) {
+        return false;
+    }
+    checksum = virt_llm_tensor_checksum(&s->model_tensors[count], checksum);
+    count++;
+
+    for (uint32_t layer = 0; layer < VIRT_LLM_QWEN_LAYERS; layer++) {
+        for (uint32_t slot = 0; slot < ARRAY_SIZE(layer_slots); slot++) {
+            char name[96];
+            uint32_t tensor_id = VIRT_LLM_TENSOR_ID_LAYER_BASE +
+                                 layer * VIRT_LLM_TENSOR_ID_LAYER_STRIDE + slot;
+
+            snprintf(name, sizeof(name), "model.layers.%u.%s", layer,
+                     layer_slots[slot]);
+            if (!virt_llm_parse_safetensors_tensor(&s->model_tensors[count],
+                                                   json, json_len, name,
+                                                   tensor_id)) {
+                return false;
+            }
+            checksum = virt_llm_tensor_checksum(&s->model_tensors[count],
+                                                checksum);
+            count++;
+        }
+    }
+
+    s->model_loaded = true;
+    s->model_tensor_count = count;
+    s->model_checksum = checksum;
+    return count == VIRT_LLM_QWEN_TENSORS;
+}
+
 static uint32_t virt_llm_process_model_load(VirtLLMState *s,
                                             VirtLLMDesc *desc)
 {
-    desc->result = cpu_to_le32(0x5157454eu);
+    if (!virt_llm_load_qwen_tensor_table(s)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "virt-llm: failed to parse safetensors metadata from %s\n",
+                      VIRT_LLM_SAFETENSORS_PATH);
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "virt-llm: loaded safetensors metadata tensors=%u checksum=0x%08x\n",
+                  s->model_tensor_count, s->model_checksum);
+    desc->result = cpu_to_le32(s->model_tensor_count);
     return VIRT_LLM_DESC_COMPLETE;
 }
 
@@ -938,7 +1344,7 @@ static uint32_t virt_llm_process_model_query(VirtLLMState *s,
     }
 
     query.abi = cpu_to_le32(VIRT_LLM_TENSOR_ABI_VERSION);
-    query.model_loaded = cpu_to_le32(1);
+    query.model_loaded = cpu_to_le32(s->model_loaded ? 1 : 0);
     query.layers = cpu_to_le32(VIRT_LLM_QWEN_LAYERS);
     query.hidden_size = cpu_to_le32(VIRT_LLM_QWEN_HIDDEN);
     query.attention_heads = cpu_to_le32(VIRT_LLM_QWEN_HEADS);
@@ -1707,6 +2113,10 @@ static void virt_llm_reset(DeviceState *dev)
     s->scalar_status = VIRT_LLM_SCALAR_IDLE;
     s->scalar_last_kernel = 0;
     s->scalar_last_opcode = 0;
+    s->model_loaded = false;
+    s->model_tensor_count = 0;
+    s->model_checksum = 0;
+    memset(s->model_tensors, 0, sizeof(s->model_tensors));
     pci_set_irq(PCI_DEVICE(s), 0);
     msi_reset(PCI_DEVICE(s));
     msix_reset(PCI_DEVICE(s));
