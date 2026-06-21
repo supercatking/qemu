@@ -13,6 +13,7 @@
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qom/object.h"
+#include <math.h>
 
 #define TYPE_VIRT_LLM "virt-llm"
 OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
@@ -84,13 +85,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_OP_GEMM_U32   0x0200
 #define VIRT_LLM_OP_CONV2D_U32 0x0201
 #define VIRT_LLM_OP_ATTENTION_Q16 0x0202
+#define VIRT_LLM_OP_MODEL_LOAD 0x0300
+#define VIRT_LLM_OP_MODEL_QUERY 0x0301
+#define VIRT_LLM_OP_EMBED_LOOKUP_F32 0x0310
+#define VIRT_LLM_OP_RMSNORM_F32 0x0311
+#define VIRT_LLM_OP_ROPE_F32 0x0312
+#define VIRT_LLM_OP_GEMM_F32 0x0313
+#define VIRT_LLM_OP_ADD_F32 0x0314
+#define VIRT_LLM_OP_SWIGLU_F32 0x0315
+#define VIRT_LLM_OP_QWEN_GQA_ATTENTION_F32 0x0316
+#define VIRT_LLM_OP_LM_HEAD_F32 0x0317
+#define VIRT_LLM_OP_ARGMAX_F32 0x0318
 #define VIRT_LLM_DESC_F_READY  BIT(0)
 #define VIRT_LLM_DESC_COMPLETE 1
 #define VIRT_LLM_DESC_INVALID  0x80000001u
 #define VIRT_LLM_DESC_UNSUPP   0x80000002u
 #define VIRT_LLM_DESC_BAD_LEN  0x80000003u
 #define VIRT_LLM_DESC_BAD_KERNEL 0x80000004u
+#define VIRT_LLM_DESC_BAD_TENSOR 0x80000005u
 #define VIRT_LLM_MAX_XFER      4096
+#define VIRT_LLM_TENSOR_MAX_XFER (64 * MiB)
 #define VIRT_LLM_Q_CTRL_ENABLE BIT(0)
 #define VIRT_LLM_Q_CTRL_RESET  BIT(1)
 #define VIRT_LLM_Q_STATUS_EN   BIT(0)
@@ -115,6 +129,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_KERNEL_DOT_U32 2u
 #define VIRT_LLM_KERNEL_SOFTMAX_Q16 3u
 #define VIRT_LLM_KERNEL_POOL_MAX_U32 4u
+#define VIRT_LLM_TENSOR_ABI_VERSION 1u
+#define VIRT_LLM_DTYPE_U32 1u
+#define VIRT_LLM_DTYPE_F32 2u
+#define VIRT_LLM_TENSOR_F_CAUSAL BIT(0)
+#define VIRT_LLM_QWEN_LAYERS 24u
+#define VIRT_LLM_QWEN_HIDDEN 896u
+#define VIRT_LLM_QWEN_HEADS 14u
+#define VIRT_LLM_QWEN_KV_HEADS 2u
+#define VIRT_LLM_QWEN_HEAD_DIM 64u
+#define VIRT_LLM_QWEN_INTERMEDIATE 4864u
+#define VIRT_LLM_QWEN_VOCAB 151936u
 
 typedef struct VirtLLMDesc {
     uint32_t opcode;
@@ -149,6 +174,41 @@ typedef struct VirtLLMKernelMeta {
     uint32_t binary_checksum;
     const char *name;
 } VirtLLMKernelMeta;
+
+typedef struct VirtLLMTensorReq {
+    uint32_t abi;
+    uint32_t dtype;
+    uint32_t rank;
+    uint32_t flags;
+    uint32_t layer_id;
+    uint32_t tensor_id;
+    uint32_t aux_tensor_id;
+    uint32_t reserved0;
+    uint32_t dims[4];
+    uint32_t input_offset;
+    uint32_t weight_offset;
+    uint32_t aux_offset;
+    uint32_t output_offset;
+    uint32_t input2_offset;
+    uint32_t reserved1;
+    uint64_t scalar0_bits;
+    uint64_t scalar1_bits;
+} QEMU_PACKED VirtLLMTensorReq;
+
+typedef struct VirtLLMModelQuery {
+    uint32_t abi;
+    uint32_t model_loaded;
+    uint32_t layers;
+    uint32_t hidden_size;
+    uint32_t attention_heads;
+    uint32_t kv_heads;
+    uint32_t head_dim;
+    uint32_t intermediate_size;
+    uint32_t vocab_size;
+    uint32_t dtype;
+    uint64_t rope_theta_bits;
+    uint64_t rms_eps_bits;
+} QEMU_PACKED VirtLLMModelQuery;
 
 static const VirtLLMKernelMeta virt_llm_kernels[] = {
     {
@@ -230,6 +290,68 @@ static const VirtLLMKernelMeta *virt_llm_find_kernel(uint32_t kernel_id)
     }
 
     return NULL;
+}
+
+static double virt_llm_double_from_bits(uint64_t bits, double fallback)
+{
+    union {
+        uint64_t u;
+        double d;
+    } v;
+
+    if (!bits) {
+        return fallback;
+    }
+    v.u = bits;
+    return v.d;
+}
+
+static uint64_t virt_llm_double_to_bits(double d)
+{
+    union {
+        uint64_t u;
+        double d;
+    } v = { .d = d };
+
+    return v.u;
+}
+
+static bool virt_llm_tensor_req_read(VirtLLMState *s, VirtLLMDesc *desc,
+                                     VirtLLMTensorReq *req)
+{
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint32_t len = le32_to_cpu(desc->len);
+
+    if (!input_addr || len < sizeof(*req)) {
+        return false;
+    }
+    pci_dma_read(PCI_DEVICE(s), input_addr, req, sizeof(*req));
+    return le32_to_cpu(req->abi) == VIRT_LLM_TENSOR_ABI_VERSION;
+}
+
+static bool virt_llm_tensor_bytes(uint64_t elems, uint64_t elem_size,
+                                  uint64_t *bytes)
+{
+    if (!elems || elems > VIRT_LLM_TENSOR_MAX_XFER / elem_size) {
+        return false;
+    }
+    *bytes = elems * elem_size;
+    return true;
+}
+
+static uint32_t virt_llm_f32_checksum(const float *data, uint64_t elems)
+{
+    uint32_t checksum = 0;
+
+    for (uint64_t i = 0; i < elems; i++) {
+        checksum += (uint32_t)lrintf(fabsf(data[i]) * 1000.0f);
+    }
+    return checksum;
+}
+
+static float virt_llm_silu(float x)
+{
+    return x / (1.0f + expf(-x));
 }
 
 static void virt_llm_raise_irq(VirtLLMState *s, uint32_t cause)
@@ -798,6 +920,450 @@ static uint32_t virt_llm_process_attention_q16(VirtLLMState *s,
     return VIRT_LLM_DESC_COMPLETE;
 }
 
+static uint32_t virt_llm_process_model_load(VirtLLMState *s,
+                                            VirtLLMDesc *desc)
+{
+    desc->result = cpu_to_le32(0x5157454eu);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_model_query(VirtLLMState *s,
+                                             VirtLLMDesc *desc)
+{
+    VirtLLMModelQuery query = { 0 };
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+
+    if (!output_addr) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    query.abi = cpu_to_le32(VIRT_LLM_TENSOR_ABI_VERSION);
+    query.model_loaded = cpu_to_le32(1);
+    query.layers = cpu_to_le32(VIRT_LLM_QWEN_LAYERS);
+    query.hidden_size = cpu_to_le32(VIRT_LLM_QWEN_HIDDEN);
+    query.attention_heads = cpu_to_le32(VIRT_LLM_QWEN_HEADS);
+    query.kv_heads = cpu_to_le32(VIRT_LLM_QWEN_KV_HEADS);
+    query.head_dim = cpu_to_le32(VIRT_LLM_QWEN_HEAD_DIM);
+    query.intermediate_size = cpu_to_le32(VIRT_LLM_QWEN_INTERMEDIATE);
+    query.vocab_size = cpu_to_le32(VIRT_LLM_QWEN_VOCAB);
+    query.dtype = cpu_to_le32(VIRT_LLM_DTYPE_F32);
+    query.rope_theta_bits = cpu_to_le64(virt_llm_double_to_bits(1000000.0));
+    query.rms_eps_bits = cpu_to_le64(virt_llm_double_to_bits(1.0e-6));
+    pci_dma_write(PCI_DEVICE(s), output_addr, &query, sizeof(query));
+    desc->result = cpu_to_le32(VIRT_LLM_QWEN_HIDDEN);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_embed_lookup_f32(VirtLLMState *s,
+                                                  VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree uint32_t *tokens = NULL;
+    g_autofree float *embedding = NULL;
+    g_autofree float *out = NULL;
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint64_t weight_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+    uint32_t seq, hidden, vocab;
+    uint64_t token_bytes, embedding_bytes, out_bytes;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    seq = le32_to_cpu(req.dims[0]);
+    hidden = le32_to_cpu(req.dims[1]);
+    vocab = le32_to_cpu(req.dims[2]);
+    if (!input_addr || !weight_addr || !output_addr || !seq || !hidden ||
+        !vocab ||
+        !virt_llm_tensor_bytes(seq, sizeof(uint32_t), &token_bytes) ||
+        !virt_llm_tensor_bytes((uint64_t)vocab * hidden, sizeof(float),
+                               &embedding_bytes) ||
+        !virt_llm_tensor_bytes((uint64_t)seq * hidden, sizeof(float),
+                               &out_bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    tokens = g_malloc(token_bytes);
+    embedding = g_malloc(embedding_bytes);
+    out = g_malloc(out_bytes);
+    pci_dma_read(PCI_DEVICE(s), input_addr + le32_to_cpu(req.input_offset),
+                 tokens, token_bytes);
+    pci_dma_read(PCI_DEVICE(s), weight_addr + le32_to_cpu(req.weight_offset),
+                 embedding, embedding_bytes);
+    for (uint32_t t = 0; t < seq; t++) {
+        uint32_t token = le32_to_cpu(tokens[t]);
+
+        if (token >= vocab) {
+            return VIRT_LLM_DESC_BAD_TENSOR;
+        }
+        memcpy(&out[(uint64_t)t * hidden], &embedding[(uint64_t)token * hidden],
+               hidden * sizeof(float));
+    }
+    pci_dma_write(PCI_DEVICE(s), output_addr + le32_to_cpu(req.output_offset),
+                  out, out_bytes);
+    desc->result = cpu_to_le32(virt_llm_f32_checksum(out, (uint64_t)seq * hidden));
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_rmsnorm_f32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree float *input = NULL;
+    g_autofree float *weight = NULL;
+    g_autofree float *out = NULL;
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint64_t weight_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+    uint32_t rows, cols;
+    uint64_t input_bytes, weight_bytes;
+    float eps;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    rows = le32_to_cpu(req.dims[0]);
+    cols = le32_to_cpu(req.dims[1]);
+    if (!input_addr || !weight_addr || !output_addr || !rows || !cols ||
+        !virt_llm_tensor_bytes((uint64_t)rows * cols, sizeof(float),
+                               &input_bytes) ||
+        !virt_llm_tensor_bytes(cols, sizeof(float), &weight_bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+
+    eps = (float)virt_llm_double_from_bits(le64_to_cpu(req.scalar0_bits), 1.0e-6);
+    input = g_malloc(input_bytes);
+    weight = g_malloc(weight_bytes);
+    out = g_malloc(input_bytes);
+    pci_dma_read(PCI_DEVICE(s), input_addr + le32_to_cpu(req.input_offset),
+                 input, input_bytes);
+    pci_dma_read(PCI_DEVICE(s), weight_addr + le32_to_cpu(req.weight_offset),
+                 weight, weight_bytes);
+    for (uint32_t r = 0; r < rows; r++) {
+        double ss = 0.0;
+
+        for (uint32_t c = 0; c < cols; c++) {
+            float v = input[(uint64_t)r * cols + c];
+
+            ss += (double)v * v;
+        }
+        float scale = 1.0f / sqrtf((float)(ss / cols) + eps);
+        for (uint32_t c = 0; c < cols; c++) {
+            uint64_t idx = (uint64_t)r * cols + c;
+
+            out[idx] = input[idx] * scale * weight[c];
+        }
+    }
+    pci_dma_write(PCI_DEVICE(s), output_addr + le32_to_cpu(req.output_offset),
+                  out, input_bytes);
+    desc->result = cpu_to_le32(virt_llm_f32_checksum(out, (uint64_t)rows * cols));
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_add_f32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree float *a = NULL;
+    g_autofree float *b = NULL;
+    g_autofree float *out = NULL;
+    uint64_t a_addr = le64_to_cpu(desc->input_addr);
+    uint64_t b_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t out_addr = le64_to_cpu(desc->output_addr);
+    uint64_t elems, bytes;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    elems = (uint64_t)le32_to_cpu(req.dims[0]) * le32_to_cpu(req.dims[1]);
+    if (!a_addr || !b_addr || !out_addr ||
+        !virt_llm_tensor_bytes(elems, sizeof(float), &bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+    a = g_malloc(bytes);
+    b = g_malloc(bytes);
+    out = g_malloc(bytes);
+    pci_dma_read(PCI_DEVICE(s), a_addr + le32_to_cpu(req.input_offset), a, bytes);
+    pci_dma_read(PCI_DEVICE(s), b_addr + le32_to_cpu(req.input2_offset), b, bytes);
+    for (uint64_t i = 0; i < elems; i++) {
+        out[i] = a[i] + b[i];
+    }
+    pci_dma_write(PCI_DEVICE(s), out_addr + le32_to_cpu(req.output_offset),
+                  out, bytes);
+    desc->result = cpu_to_le32(virt_llm_f32_checksum(out, elems));
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_swiglu_f32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree float *gate = NULL;
+    g_autofree float *up = NULL;
+    g_autofree float *out = NULL;
+    uint64_t gate_addr = le64_to_cpu(desc->input_addr);
+    uint64_t up_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t out_addr = le64_to_cpu(desc->output_addr);
+    uint64_t elems, bytes;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    elems = (uint64_t)le32_to_cpu(req.dims[0]) * le32_to_cpu(req.dims[1]);
+    if (!gate_addr || !up_addr || !out_addr ||
+        !virt_llm_tensor_bytes(elems, sizeof(float), &bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+    gate = g_malloc(bytes);
+    up = g_malloc(bytes);
+    out = g_malloc(bytes);
+    pci_dma_read(PCI_DEVICE(s), gate_addr + le32_to_cpu(req.input_offset),
+                 gate, bytes);
+    pci_dma_read(PCI_DEVICE(s), up_addr + le32_to_cpu(req.input2_offset),
+                 up, bytes);
+    for (uint64_t i = 0; i < elems; i++) {
+        out[i] = virt_llm_silu(gate[i]) * up[i];
+    }
+    pci_dma_write(PCI_DEVICE(s), out_addr + le32_to_cpu(req.output_offset),
+                  out, bytes);
+    desc->result = cpu_to_le32(virt_llm_f32_checksum(out, elems));
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_argmax_f32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree float *input = NULL;
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+    uint32_t count, best = 0;
+    uint64_t bytes;
+    uint32_t out_token;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    count = le32_to_cpu(req.dims[0]);
+    if (!input_addr || !output_addr ||
+        !virt_llm_tensor_bytes(count, sizeof(float), &bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+    input = g_malloc(bytes);
+    pci_dma_read(PCI_DEVICE(s), input_addr + le32_to_cpu(req.input_offset),
+                 input, bytes);
+    for (uint32_t i = 1; i < count; i++) {
+        if (input[i] > input[best]) {
+            best = i;
+        }
+    }
+    out_token = cpu_to_le32(best);
+    pci_dma_write(PCI_DEVICE(s), output_addr + le32_to_cpu(req.output_offset),
+                  &out_token, sizeof(out_token));
+    desc->result = cpu_to_le32(best);
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_gemm_f32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree float *a = NULL;
+    g_autofree float *b = NULL;
+    g_autofree float *c = NULL;
+    uint64_t a_addr = le64_to_cpu(desc->input_addr);
+    uint64_t b_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t c_addr = le64_to_cpu(desc->output_addr);
+    uint32_t m, n, k;
+    uint64_t a_bytes, b_bytes, c_bytes;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    m = le32_to_cpu(req.dims[0]);
+    n = le32_to_cpu(req.dims[1]);
+    k = le32_to_cpu(req.dims[2]);
+    if (!a_addr || !b_addr || !c_addr || !m || !n || !k ||
+        !virt_llm_tensor_bytes((uint64_t)m * k, sizeof(float), &a_bytes) ||
+        !virt_llm_tensor_bytes((uint64_t)k * n, sizeof(float), &b_bytes) ||
+        !virt_llm_tensor_bytes((uint64_t)m * n, sizeof(float), &c_bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+    a = g_malloc(a_bytes);
+    b = g_malloc(b_bytes);
+    c = g_new0(float, (uint64_t)m * n);
+    pci_dma_read(PCI_DEVICE(s), a_addr + le32_to_cpu(req.input_offset), a,
+                 a_bytes);
+    pci_dma_read(PCI_DEVICE(s), b_addr + le32_to_cpu(req.weight_offset), b,
+                 b_bytes);
+    for (uint32_t row = 0; row < m; row++) {
+        for (uint32_t col = 0; col < n; col++) {
+            double sum = 0.0;
+
+            for (uint32_t inner = 0; inner < k; inner++) {
+                sum += (double)a[(uint64_t)row * k + inner] *
+                       b[(uint64_t)inner * n + col];
+            }
+            c[(uint64_t)row * n + col] = (float)sum;
+        }
+    }
+    pci_dma_write(PCI_DEVICE(s), c_addr + le32_to_cpu(req.output_offset), c,
+                  c_bytes);
+    desc->result = cpu_to_le32(virt_llm_f32_checksum(c, (uint64_t)m * n));
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_rope_f32(VirtLLMState *s, VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree float *input = NULL;
+    g_autofree float *out = NULL;
+    uint64_t input_addr = le64_to_cpu(desc->input_addr);
+    uint64_t output_addr = le64_to_cpu(desc->output_addr);
+    uint32_t seq, heads, head_dim;
+    uint64_t elems, bytes;
+    double theta;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    seq = le32_to_cpu(req.dims[0]);
+    heads = le32_to_cpu(req.dims[1]);
+    head_dim = le32_to_cpu(req.dims[2]);
+    elems = (uint64_t)seq * heads * head_dim;
+    if (!input_addr || !output_addr || !seq || !heads || !head_dim ||
+        head_dim % 2 ||
+        !virt_llm_tensor_bytes(elems, sizeof(float), &bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+    theta = virt_llm_double_from_bits(le64_to_cpu(req.scalar0_bits), 1000000.0);
+    input = g_malloc(bytes);
+    out = g_malloc(bytes);
+    pci_dma_read(PCI_DEVICE(s), input_addr + le32_to_cpu(req.input_offset),
+                 input, bytes);
+    memcpy(out, input, bytes);
+    for (uint32_t pos = 0; pos < seq; pos++) {
+        for (uint32_t h = 0; h < heads; h++) {
+            float *base = &out[((uint64_t)pos * heads + h) * head_dim];
+
+            for (uint32_t d = 0; d < head_dim; d += 2) {
+                double inv = pow(theta, -(double)d / head_dim);
+                double angle = pos * inv;
+                float x0 = base[d];
+                float x1 = base[d + 1];
+                float c = cos(angle);
+                float si = sin(angle);
+
+                base[d] = x0 * c - x1 * si;
+                base[d + 1] = x0 * si + x1 * c;
+            }
+        }
+    }
+    pci_dma_write(PCI_DEVICE(s), output_addr + le32_to_cpu(req.output_offset),
+                  out, bytes);
+    desc->result = cpu_to_le32(virt_llm_f32_checksum(out, elems));
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
+static uint32_t virt_llm_process_qwen_gqa_attention_f32(VirtLLMState *s,
+                                                        VirtLLMDesc *desc)
+{
+    VirtLLMTensorReq req;
+    g_autofree float *q = NULL;
+    g_autofree float *k = NULL;
+    g_autofree float *v = NULL;
+    g_autofree float *out = NULL;
+    g_autofree float *scores = NULL;
+    uint64_t q_addr = le64_to_cpu(desc->input_addr);
+    uint64_t k_addr = le64_to_cpu(desc->rsvd1);
+    uint64_t v_addr = le64_to_cpu(desc->rsvd2);
+    uint64_t out_addr = le64_to_cpu(desc->output_addr);
+    uint32_t seq, heads, kv_heads, head_dim;
+    uint64_t q_bytes, kv_bytes, out_bytes;
+    float scale;
+
+    if (!virt_llm_tensor_req_read(s, desc, &req) ||
+        le32_to_cpu(req.dtype) != VIRT_LLM_DTYPE_F32) {
+        return VIRT_LLM_DESC_BAD_TENSOR;
+    }
+    seq = le32_to_cpu(req.dims[0]);
+    heads = le32_to_cpu(req.dims[1]);
+    kv_heads = le32_to_cpu(req.dims[2]);
+    head_dim = le32_to_cpu(req.dims[3]);
+    if (!q_addr || !k_addr || !v_addr || !out_addr || !seq || !heads ||
+        !kv_heads || !head_dim || heads % kv_heads ||
+        !virt_llm_tensor_bytes((uint64_t)seq * heads * head_dim, sizeof(float),
+                               &q_bytes) ||
+        !virt_llm_tensor_bytes((uint64_t)seq * kv_heads * head_dim,
+                               sizeof(float), &kv_bytes) ||
+        !virt_llm_tensor_bytes((uint64_t)seq * heads * head_dim, sizeof(float),
+                               &out_bytes)) {
+        return VIRT_LLM_DESC_BAD_LEN;
+    }
+    q = g_malloc(q_bytes);
+    k = g_malloc(kv_bytes);
+    v = g_malloc(kv_bytes);
+    out = g_new0(float, (uint64_t)seq * heads * head_dim);
+    scores = g_malloc(seq * sizeof(float));
+    pci_dma_read(PCI_DEVICE(s), q_addr + le32_to_cpu(req.input_offset), q,
+                 q_bytes);
+    pci_dma_read(PCI_DEVICE(s), k_addr + le32_to_cpu(req.weight_offset), k,
+                 kv_bytes);
+    pci_dma_read(PCI_DEVICE(s), v_addr + le32_to_cpu(req.aux_offset), v,
+                 kv_bytes);
+    scale = 1.0f / sqrtf((float)head_dim);
+
+    for (uint32_t t = 0; t < seq; t++) {
+        for (uint32_t h = 0; h < heads; h++) {
+            uint32_t kvh = h / (heads / kv_heads);
+            uint32_t cols = (le32_to_cpu(req.flags) & VIRT_LLM_TENSOR_F_CAUSAL) ?
+                            t + 1 : seq;
+            float max_score = -INFINITY;
+            float sum_exp = 0.0f;
+
+            for (uint32_t j = 0; j < cols; j++) {
+                float score = 0.0f;
+                float *qv = &q[((uint64_t)t * heads + h) * head_dim];
+                float *kv = &k[((uint64_t)j * kv_heads + kvh) * head_dim];
+
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    score += qv[d] * kv[d];
+                }
+                score *= scale;
+                scores[j] = score;
+                if (score > max_score) {
+                    max_score = score;
+                }
+            }
+            for (uint32_t j = 0; j < cols; j++) {
+                scores[j] = expf(scores[j] - max_score);
+                sum_exp += scores[j];
+            }
+            if (sum_exp == 0.0f) {
+                return VIRT_LLM_DESC_BAD_TENSOR;
+            }
+            for (uint32_t d = 0; d < head_dim; d++) {
+                float acc = 0.0f;
+
+                for (uint32_t j = 0; j < cols; j++) {
+                    float prob = scores[j] / sum_exp;
+                    float vv = v[((uint64_t)j * kv_heads + kvh) * head_dim + d];
+
+                    acc += prob * vv;
+                }
+                out[((uint64_t)t * heads + h) * head_dim + d] = acc;
+            }
+        }
+    }
+    pci_dma_write(PCI_DEVICE(s), out_addr + le32_to_cpu(req.output_offset), out,
+                  out_bytes);
+    desc->result = cpu_to_le32(virt_llm_f32_checksum(out,
+                                                     (uint64_t)seq * heads * head_dim));
+    return VIRT_LLM_DESC_COMPLETE;
+}
+
 static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
                                        uint32_t opcode, uint32_t *backend)
 {
@@ -823,6 +1389,37 @@ static uint32_t virt_llm_dispatch_desc(VirtLLMState *s, VirtLLMDesc *desc,
     case VIRT_LLM_OP_ATTENTION_Q16:
         *backend = VIRT_LLM_BACKEND_TENSOR;
         return virt_llm_process_attention_q16(s, desc);
+    case VIRT_LLM_OP_MODEL_LOAD:
+        *backend = VIRT_LLM_BACKEND_DMA;
+        return virt_llm_process_model_load(s, desc);
+    case VIRT_LLM_OP_MODEL_QUERY:
+        *backend = VIRT_LLM_BACKEND_DMA;
+        return virt_llm_process_model_query(s, desc);
+    case VIRT_LLM_OP_EMBED_LOOKUP_F32:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_embed_lookup_f32(s, desc);
+    case VIRT_LLM_OP_RMSNORM_F32:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_rmsnorm_f32(s, desc);
+    case VIRT_LLM_OP_ROPE_F32:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_rope_f32(s, desc);
+    case VIRT_LLM_OP_GEMM_F32:
+    case VIRT_LLM_OP_LM_HEAD_F32:
+        *backend = VIRT_LLM_BACKEND_TENSOR;
+        return virt_llm_process_gemm_f32(s, desc);
+    case VIRT_LLM_OP_ADD_F32:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_add_f32(s, desc);
+    case VIRT_LLM_OP_SWIGLU_F32:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_swiglu_f32(s, desc);
+    case VIRT_LLM_OP_QWEN_GQA_ATTENTION_F32:
+        *backend = VIRT_LLM_BACKEND_TENSOR;
+        return virt_llm_process_qwen_gqa_attention_f32(s, desc);
+    case VIRT_LLM_OP_ARGMAX_F32:
+        *backend = VIRT_LLM_BACKEND_VECTOR;
+        return virt_llm_process_argmax_f32(s, desc);
     default:
         *backend = UINT32_MAX;
         return VIRT_LLM_DESC_UNSUPP;
