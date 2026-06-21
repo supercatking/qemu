@@ -1862,17 +1862,18 @@ static uint32_t virt_llm_process_rope_f32(VirtLLMState *s, VirtLLMDesc *desc)
     for (uint32_t pos = 0; pos < seq; pos++) {
         for (uint32_t h = 0; h < heads; h++) {
             float *base = &out[((uint64_t)pos * heads + h) * head_dim];
+            uint32_t half = head_dim / 2;
 
-            for (uint32_t d = 0; d < head_dim; d += 2) {
-                double inv = pow(theta, -(double)d / head_dim);
+            for (uint32_t d = 0; d < half; d++) {
+                double inv = pow(theta, -(double)(2 * d) / head_dim);
                 double angle = pos * inv;
                 float x0 = base[d];
-                float x1 = base[d + 1];
+                float x1 = base[d + half];
                 float c = cos(angle);
                 float si = sin(angle);
 
                 base[d] = x0 * c - x1 * si;
-                base[d + 1] = x0 * si + x1 * c;
+                base[d + half] = x0 * si + x1 * c;
             }
         }
     }

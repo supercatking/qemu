@@ -16,10 +16,7 @@ DEFAULT_MODEL = os.environ.get(
     os.environ.get("VIRT_LLM_MODEL_PATH", "/home/zyz/llmsim/models/qwen2.5-0.5b-instruct"),
 )
 DEFAULT_ARTIFACT_PREFIX = "model"
-DEFAULT_PROMPTS = [
-    "What is the capital of France?",
-    "Write one short sentence about RISC-V.",
-]
+DEFAULT_PROMPTS = ["What is the capital of France?"]
 
 
 def require_deps() -> tuple[Any, Any, Any, Any]:
@@ -42,7 +39,11 @@ def require_deps() -> tuple[Any, Any, Any, Any]:
             + "\nInstall example:\n"
             + "  python3 -m venv ${VIRT_LLM_REF_VENV:-.venv-virt-llm-ref}\n"
             + "  ${VIRT_LLM_REF_VENV:-.venv-virt-llm-ref}/bin/pip install "
-            + "torch transformers safetensors huggingface_hub",
+            + "--upgrade pip\n"
+            + "  ${VIRT_LLM_REF_VENV:-.venv-virt-llm-ref}/bin/pip install "
+            + "--index-url https://download.pytorch.org/whl/cpu torch\n"
+            + "  ${VIRT_LLM_REF_VENV:-.venv-virt-llm-ref}/bin/pip install "
+            + "transformers safetensors huggingface_hub",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -83,16 +84,45 @@ def config_to_manifest(model_id: str, config: Any) -> dict[str, Any]:
         "max_position_embeddings",
         "rms_norm_eps",
         "rope_theta",
+        "rope_parameters",
+        "hidden_act",
+        "attention_dropout",
+        "sliding_window",
+        "use_sliding_window",
         "tie_word_embeddings",
         "torch_dtype",
+        "dtype",
         "bos_token_id",
         "eos_token_id",
         "pad_token_id",
     ]
     manifest = {k: data.get(k) for k in keys if k in data}
+    hidden_size = data.get("hidden_size")
+    num_heads = data.get("num_attention_heads")
+    if hidden_size and num_heads:
+        manifest["head_dim"] = hidden_size // num_heads
+    if manifest.get("rope_theta") is None:
+        rope_parameters = data.get("rope_parameters") or {}
+        manifest["rope_theta"] = rope_parameters.get("rope_theta")
     manifest["model_id"] = model_id
-    manifest["reference_dtype"] = str(data.get("torch_dtype", "unknown"))
+    manifest["reference_dtype"] = str(data.get("torch_dtype", data.get("dtype", "unknown")))
     return manifest
+
+
+def token_text(tokenizer: Any, token_id: int) -> str:
+    return tokenizer.decode([token_id], skip_special_tokens=False)
+
+
+def tensor_checksum(torch: Any, tensor: Any) -> dict[str, Any]:
+    t = tensor.detach().to(torch.float32).cpu()
+    return {
+        "shape": list(t.shape),
+        "sum": float(t.sum().item()),
+        "mean": float(t.mean().item()),
+        "abs_sum": float(t.abs().sum().item()),
+        "max": float(t.max().item()),
+        "min": float(t.min().item()),
+    }
 
 
 def write_manifest(out_dir: Path, prefix: str, manifest: dict[str, Any]) -> Path:
@@ -109,12 +139,15 @@ def run_generation(
     prompt: str,
     max_new_tokens: int,
     device: str,
+    top_k: int,
 ) -> dict[str, Any]:
     rendered = render_prompt(tokenizer, prompt)
     encoded = tokenizer(rendered, return_tensors="pt")
     encoded = {k: v.to(device) for k, v in encoded.items()}
 
     with torch.no_grad():
+        logits = model(**encoded).logits[:, -1, :]
+        top_values, top_indices = torch.topk(logits[0], k=top_k)
         generated = model.generate(
             **encoded,
             do_sample=False,
@@ -128,12 +161,33 @@ def run_generation(
     input_ids = encoded["input_ids"][0].detach().cpu().tolist()
     output_ids = generated[0].detach().cpu().tolist()
     new_token_ids = output_ids[len(input_ids):]
+    expected_first_new_token = new_token_ids[0] if new_token_ids else None
+    top_logits = [
+        {
+            "token_id": int(token_id),
+            "logit": float(logit),
+            "text": token_text(tokenizer, int(token_id)),
+        }
+        for token_id, logit in zip(
+            top_indices.detach().cpu().tolist(),
+            top_values.detach().cpu().tolist(),
+        )
+    ]
     return {
         "prompt": prompt,
         "rendered_prompt": rendered,
         "input_ids": input_ids,
+        "input_len": len(input_ids),
         "new_token_ids": new_token_ids,
+        "expected_first_new_token": expected_first_new_token,
+        "expected_first_new_token_text": (
+            token_text(tokenizer, expected_first_new_token)
+            if expected_first_new_token is not None
+            else ""
+        ),
         "output_ids": output_ids,
+        "top_logits": top_logits,
+        "last_prompt_logits_checksum": tensor_checksum(torch, logits),
         "decoded_output": tokenizer.decode(output_ids, skip_special_tokens=False),
         "decoded_new_text": tokenizer.decode(new_token_ids, skip_special_tokens=False),
     }
@@ -148,12 +202,14 @@ def main() -> int:
     )
     parser.add_argument("--artifact-prefix", default=DEFAULT_ARTIFACT_PREFIX)
     parser.add_argument("--prompt", action="append", default=[])
-    parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=1)
+    parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="cpu")
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
     parser.add_argument(
         "--local-files-only",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Only read an already downloaded Hugging Face snapshot or local model path.",
     )
     parser.add_argument(
@@ -174,6 +230,10 @@ def main() -> int:
     dtype = pick_dtype(torch, args.dtype)
 
     torch.manual_seed(0)
+    if hasattr(torch, "set_num_threads"):
+        torch.set_num_threads(int(os.environ.get("VIRT_LLM_REF_THREADS", "1")))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
     hf_load_args = {"local_files_only": args.local_files_only}
     config = AutoConfig.from_pretrained(args.model_id, **hf_load_args)
     prompts = args.prompt or DEFAULT_PROMPTS
@@ -182,7 +242,9 @@ def main() -> int:
         {
             "reference_device": device,
             "reference_load_dtype": args.dtype,
+            "local_files_only": args.local_files_only,
             "max_new_tokens": args.max_new_tokens,
+            "top_k": args.top_k,
             "prompts": prompts,
         }
     )
@@ -203,11 +265,13 @@ def main() -> int:
     model.eval()
     golden = {
         "model_id": args.model_id,
+        "manifest": manifest,
         "max_new_tokens": args.max_new_tokens,
         "device": device,
         "dtype": args.dtype,
+        "local_files_only": args.local_files_only,
         "generations": [
-            run_generation(torch, tokenizer, model, prompt, args.max_new_tokens, device)
+            run_generation(torch, tokenizer, model, prompt, args.max_new_tokens, device, args.top_k)
             for prompt in prompts
         ],
     }
@@ -219,7 +283,10 @@ def main() -> int:
     print(f"Wrote {golden_path}")
     for item in golden["generations"]:
         print(f"PROMPT: {item['prompt']}")
+        print(f"INPUT_IDS: {item['input_ids']}")
         print(f"NEW_TOKEN_IDS: {item['new_token_ids']}")
+        print(f"EXPECTED_FIRST_NEW_TOKEN: {item['expected_first_new_token']}")
+        print(f"TOP_LOGITS: {item['top_logits']}")
         print(f"NEW_TEXT: {item['decoded_new_text']!r}")
     return 0
 

@@ -516,7 +516,8 @@ Responsibilities:
 - `virt-llm-test.c`: basic info, model load/query, GEMM, attention, primitive
   FP32 op validation.
 - `virt-llm-qwen.c`: freestanding RISC-V init program that submits a Qwen
-  per-op graph and validates single-token and short decode smoke paths.
+  per-op graph and reports the strict `QWEN_INFER_OK` true-inference marker
+  once the generated token matches the host golden fixture.
 
 ### Host Run Scripts
 
@@ -670,6 +671,30 @@ The repository now carries the helper entry points that were previously only pre
 ```
 
 The validation and Qwen scripts generate their initramfs inputs before booting, check required binaries and files up front, and write logs under `VIRT_LLM_LOG_DIR`.
+
+### Minimal Qwen True-Inference Validation
+
+To run the strict Qwen path, provide the local safetensors file:
+
+```bash
+VIRT_LLM_MODEL_PATH=/path/to/qwen2.5-0.5b-instruct/model.safetensors \
+  /home/qemu/qemu/tools/virt_llm/run_virt_llm_qwen.sh
+```
+
+The required success markers are:
+
+```text
+qwen model load ok
+qwen full layers ok
+QWEN_INFER_OK ...
+```
+
+The older `QWEN_SINGLE_TOKEN_OK` and `QWEN_DECODE_OK` markers indicate only the
+legacy smoke path and do not satisfy the strict true-inference gate.
+
+For fresh-clone reproduction, the Windows-side helper keeps the basic validation
+unchanged.  It runs the Qwen true-inference gate only when the caller explicitly
+sets `VIRT_LLM_MODEL_PATH`; otherwise it records the Qwen check as skipped.
 
 ### Remaining Local Inputs
 
