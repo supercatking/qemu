@@ -37,9 +37,10 @@ fi
 virt_llm_step "build QEMU virt-llm targets=$QEMU_TARGET_LIST build=$QEMU_BUILD jobs=$JOBS"
 if [ "$need_configure" = 1 ]; then
   virt_llm_step "configure QEMU target-list=$QEMU_TARGET_LIST flags=$QEMU_CONFIGURE_FLAGS"
+  mkdir -p "$QEMU_BUILD"
   (
-    cd "$QEMU_SRC"
-    ./configure --target-list="$QEMU_TARGET_LIST" $QEMU_CONFIGURE_FLAGS
+    cd "$QEMU_BUILD"
+    "$QEMU_SRC/configure" --target-list="$QEMU_TARGET_LIST" $QEMU_CONFIGURE_FLAGS
   )
 else
   virt_llm_info "reuse existing QEMU build directory: $QEMU_BUILD"
