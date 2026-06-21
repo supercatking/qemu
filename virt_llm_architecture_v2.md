@@ -56,7 +56,7 @@ flowchart LR
 | --- | --- | --- |
 | `0x0000..0x00ff` | `INFER_XOR`, `DMA_COPY` | compatibility or DMA |
 | `0x0100..0x01ff` | `VECTOR_ADD_U32`, `DOT_U32`, `SOFTMAX_Q16`, `POOL_MAX_U32` | scalar dispatcher then vector backend |
-| `0x0200..0x02ff` | `GEMM_U32`, `CONV2D_U32` | tensor core backend |
+| `0x0200..0x02ff` | `GEMM_U32`, `CONV2D_U32`, `ATTENTION_Q16` | tensor core backend |
 | other | none | unsupported opcode completion |
 
 Vector commands are intentionally routed through the scalar dispatcher. Tensor
@@ -218,6 +218,32 @@ or ABI mismatch fail with `DESC_BAD_KERNEL`.
 3. Command front end sends request directly to tensor core backend.
 4. Tensor core helper computes valid convolution with stride 1 and no padding.
 5. CQ entry reports backend `TENSOR`.
+
+### Attention Q16
+
+`ATTENTION_Q16` is the first end-to-end attention operator simulation. It is a
+small-shape tensor backend command, not a scalar-dispatched vector kernel.
+
+Descriptor mapping:
+
+| Field | Meaning |
+| --- | --- |
+| `input_addr` | Q matrix, Q16 values stored as little-endian u32 |
+| `rsvd1` / `aux_addr` | K matrix, Q16 u32 |
+| `rsvd2` / `args0` | V matrix DMA address, Q16 u32 |
+| `output_addr` | Output matrix, Q16 u32 |
+| `len` | `seq_len | head_dim << 16` |
+| `rsvd3` / `args1` | reserved for future attention flags |
+
+The v1 limits are `seq_len <= 8` and `head_dim <= 8`. QEMU computes
+`scores = Q * K^T`, applies a causal mask, normalizes each row with a
+deterministic Q16 softmax approximation, and computes `output = probs * V`.
+This validates the hardware data flow before adding real FP16/BF16 formats,
+larger tiling, or KV cache.
+
+Validation uses a `seq_len=3`, `head_dim=2` causal case with equal Q/K scores,
+so every output row is a deterministic prefix average over V. The Linux driver
+checks descriptor status, CQ backend/result, and every output element.
 
 ## Validation Strategy
 
