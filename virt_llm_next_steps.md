@@ -259,16 +259,26 @@ INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 
 ## Immediate Next Coding Step
 
-The best next coding step is to make the command queue more realistic:
+The queue/CQ batch validation step has been implemented locally in the Linux
+6.12 driver:
 
-1. Add command batching with several descriptors submitted before one kick.
-2. Add ring wrap-around tests for SQ and CQ.
-3. Add device-owned completion flags or generation bits.
-4. Add queue-full and CQ-full error handling.
-5. Re-run the riscv32 Linux 6.12 boot validation.
+- four DMA descriptors are submitted with one kick;
+- SQ index wraps through the 4-entry ring;
+- CQ entries are checked across the CQ ring;
+- validation passed with `batch wrap ok: q_head=6->10 cq_tail=6->10`.
 
-This will make the front-end queue behave more like hardware instead of a
-single-command-at-a-time validation path.
+The next coding step is Phase 1 of the RISC-V32 scalar dispatcher:
+
+1. Add scalar dispatcher state and capability registers.
+2. Add feature bit for scalar dispatch.
+3. Route vector opcodes through `virt_llm_scalar_dispatch()`.
+4. Make CQ report backend `SCALAR` for scalar-routed vector commands.
+5. Update Linux validation to set kernel ids and verify scalar backend CQ
+   entries.
+6. Re-run the riscv32 Linux 6.12 boot validation.
+
+This introduces the control-plane split needed for kernel dispatch without
+attempting to execute arbitrary uploaded RISC-V32 code in the same step.
 
 ## Implementation Phases for the LLM Accelerator Shape
 
