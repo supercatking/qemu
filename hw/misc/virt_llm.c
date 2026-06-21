@@ -39,6 +39,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_REG_Q_CTRL   0x44
 #define VIRT_LLM_REG_Q_STATUS 0x48
 #define VIRT_LLM_REG_Q_ERROR  0x4c
+#define VIRT_LLM_REG_CQ_SIZE  0x50
+#define VIRT_LLM_REG_CQ_LO    0x54
+#define VIRT_LLM_REG_CQ_HI    0x58
+#define VIRT_LLM_REG_CQ_HEAD  0x5c
+#define VIRT_LLM_REG_CQ_TAIL  0x60
 
 #define VIRT_LLM_MAGIC        0x4c4c4d31u /* "LLM1" */
 #define VIRT_LLM_VERSION      3u
@@ -52,6 +57,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_FEATURE_MSI   BIT(1)
 #define VIRT_LLM_FEATURE_MSIX  BIT(2)
 #define VIRT_LLM_FEATURE_QCTRL BIT(3)
+#define VIRT_LLM_FEATURE_CQ    BIT(4)
 
 #define VIRT_LLM_IRQ_COMPLETE  BIT(0)
 #define VIRT_LLM_IRQ_ERROR     BIT(1)
@@ -95,6 +101,16 @@ typedef struct VirtLLMDesc {
     uint64_t rsvd3;
 } QEMU_PACKED VirtLLMDesc;
 
+typedef struct VirtLLMCpl {
+    uint32_t command_id;
+    uint32_t opcode;
+    uint32_t backend;
+    uint32_t status;
+    uint32_t result;
+    uint32_t q_head;
+    uint64_t rsvd0;
+} QEMU_PACKED VirtLLMCpl;
+
 struct VirtLLMState {
     PCIDevice parent_obj;
     MemoryRegion mmio;
@@ -108,6 +124,10 @@ struct VirtLLMState {
     uint32_t queue_ctrl;
     uint32_t queue_status;
     uint32_t queue_error;
+    uint64_t cq_addr;
+    uint32_t cq_size;
+    uint32_t cq_head;
+    uint32_t cq_tail;
 };
 
 static void virt_llm_raise_irq(VirtLLMState *s, uint32_t cause)
@@ -141,6 +161,37 @@ static uint64_t virt_llm_desc_addr(VirtLLMState *s, uint32_t idx)
     return s->queue_addr + (idx * sizeof(VirtLLMDesc));
 }
 
+static bool virt_llm_cq_config_valid(VirtLLMState *s)
+{
+    return s->cq_addr &&
+           s->cq_size > 0 &&
+           s->cq_size <= VIRT_LLM_MAX_QUEUE &&
+           QEMU_IS_ALIGNED(s->cq_addr, sizeof(VirtLLMCpl));
+}
+
+static void virt_llm_write_cq(VirtLLMState *s, VirtLLMDesc *desc,
+                              uint32_t opcode, uint32_t backend,
+                              uint32_t status)
+{
+    VirtLLMCpl cpl = { 0 };
+    uint32_t idx;
+
+    if (!virt_llm_cq_config_valid(s)) {
+        return;
+    }
+
+    idx = s->cq_tail % s->cq_size;
+    cpl.command_id = desc->rsvd0;
+    cpl.opcode = cpu_to_le32(opcode);
+    cpl.backend = cpu_to_le32(backend);
+    cpl.status = cpu_to_le32(status);
+    cpl.result = desc->result;
+    cpl.q_head = cpu_to_le32(s->queue_head);
+    pci_dma_write(PCI_DEVICE(s), s->cq_addr + idx * sizeof(cpl),
+                  &cpl, sizeof(cpl));
+    s->cq_tail++;
+}
+
 static void virt_llm_queue_reset(VirtLLMState *s)
 {
     s->queue_addr = 0;
@@ -150,6 +201,10 @@ static void virt_llm_queue_reset(VirtLLMState *s)
     s->queue_ctrl = 0;
     s->queue_status = 0;
     s->queue_error = VIRT_LLM_Q_ERR_NONE;
+    s->cq_addr = 0;
+    s->cq_size = 0;
+    s->cq_head = 0;
+    s->cq_tail = 0;
 }
 
 static bool virt_llm_queue_config_valid(VirtLLMState *s)
@@ -353,6 +408,7 @@ static void virt_llm_process_queue(VirtLLMState *s)
         desc.status = cpu_to_le32(status);
         pci_dma_write(PCI_DEVICE(s), addr, &desc, sizeof(desc));
         s->queue_head++;
+        virt_llm_write_cq(s, &desc, opcode, backend, status);
         qemu_log_mask(LOG_GUEST_ERROR,
                       "virt-llm: opcode=0x%04x backend=%u status=0x%08x result=0x%08x\n",
                       opcode, backend, status, le32_to_cpu(desc.result));
@@ -384,7 +440,8 @@ static uint64_t virt_llm_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return s->doorbell ^ VIRT_LLM_STATUS_XOR;
     case VIRT_LLM_REG_FEATURES:
         return VIRT_LLM_FEATURE_QUEUE | VIRT_LLM_FEATURE_MSI |
-               VIRT_LLM_FEATURE_MSIX | VIRT_LLM_FEATURE_QCTRL;
+               VIRT_LLM_FEATURE_MSIX | VIRT_LLM_FEATURE_QCTRL |
+               VIRT_LLM_FEATURE_CQ;
     case VIRT_LLM_REG_Q_SIZE:
         return s->queue_size;
     case VIRT_LLM_REG_Q_LO:
@@ -413,6 +470,16 @@ static uint64_t virt_llm_mmio_read(void *opaque, hwaddr addr, unsigned size)
         return s->queue_status;
     case VIRT_LLM_REG_Q_ERROR:
         return s->queue_error;
+    case VIRT_LLM_REG_CQ_SIZE:
+        return s->cq_size;
+    case VIRT_LLM_REG_CQ_LO:
+        return s->cq_addr;
+    case VIRT_LLM_REG_CQ_HI:
+        return s->cq_addr >> 32;
+    case VIRT_LLM_REG_CQ_HEAD:
+        return s->cq_head;
+    case VIRT_LLM_REG_CQ_TAIL:
+        return s->cq_tail;
     default:
         return 0;
     }
@@ -475,6 +542,22 @@ static void virt_llm_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         } else {
             s->queue_status &= ~VIRT_LLM_Q_STATUS_EN;
         }
+        break;
+    case VIRT_LLM_REG_CQ_SIZE:
+        s->cq_size = val;
+        s->cq_head = 0;
+        s->cq_tail = 0;
+        break;
+    case VIRT_LLM_REG_CQ_LO:
+        s->cq_addr = (s->cq_addr & 0xffffffff00000000ULL) |
+                     (val & 0xffffffffULL);
+        break;
+    case VIRT_LLM_REG_CQ_HI:
+        s->cq_addr = (s->cq_addr & 0xffffffffULL) |
+                     ((val & 0xffffffffULL) << 32);
+        break;
+    case VIRT_LLM_REG_CQ_HEAD:
+        s->cq_head = val;
         break;
     default:
         break;
