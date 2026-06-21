@@ -186,6 +186,11 @@ Architecture V2 separates these cases:
 | Bad DMA length or address | `DESC_BAD_LEN` | descriptor error |
 | Successful command | `DESC_COMPLETE` | none |
 
+The scalar dispatcher now enforces the kernel table before launching vector
+helpers. Unknown opcodes still fail at the command front end with
+`DESC_UNSUPP`; known vector opcodes with missing kernel ids, opcode mismatch,
+or ABI mismatch fail with `DESC_BAD_KERNEL`.
+
 ## Data Flow Examples
 
 ### Vector Add
@@ -243,4 +248,5 @@ virt_llm_pci ... kernel table ok: kernels=4 abi=1 first_entry=0x00001000 last_en
 INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 ```
 
-The next milestone can enforce kernel ABI validation and add negative tests.
+The kernel ABI validation milestone is complete. It validates bad kernel id and
+ABI mismatch descriptors while preserving the unknown-opcode error path.

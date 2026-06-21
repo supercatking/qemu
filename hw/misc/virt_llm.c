@@ -88,6 +88,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_DESC_INVALID  0x80000001u
 #define VIRT_LLM_DESC_UNSUPP   0x80000002u
 #define VIRT_LLM_DESC_BAD_LEN  0x80000003u
+#define VIRT_LLM_DESC_BAD_KERNEL 0x80000004u
 #define VIRT_LLM_MAX_XFER      4096
 #define VIRT_LLM_Q_CTRL_ENABLE BIT(0)
 #define VIRT_LLM_Q_CTRL_RESET  BIT(1)
@@ -97,6 +98,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtLLMState, VIRT_LLM)
 #define VIRT_LLM_Q_ERR_CONFIG  1u
 #define VIRT_LLM_Q_ERR_DESC    2u
 #define VIRT_LLM_Q_ERR_OPCODE  3u
+#define VIRT_LLM_Q_ERR_KERNEL  4u
 
 #define VIRT_LLM_BACKEND_COMPAT 0u
 #define VIRT_LLM_BACKEND_DMA    1u
@@ -216,6 +218,17 @@ static const VirtLLMKernelMeta *virt_llm_selected_kernel(VirtLLMState *s)
     }
 
     return &virt_llm_kernels[s->kernel_index];
+}
+
+static const VirtLLMKernelMeta *virt_llm_find_kernel(uint32_t kernel_id)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(virt_llm_kernels); i++) {
+        if (virt_llm_kernels[i].kernel_id == kernel_id) {
+            return &virt_llm_kernels[i];
+        }
+    }
+
+    return NULL;
 }
 
 static void virt_llm_raise_irq(VirtLLMState *s, uint32_t cause)
@@ -519,38 +532,53 @@ static uint32_t virt_llm_kernel_id(VirtLLMDesc *desc)
     return extract32(le64_to_cpu(desc->rsvd3), 0, 16);
 }
 
+static uint32_t virt_llm_kernel_abi(VirtLLMDesc *desc)
+{
+    uint32_t abi = extract32(le64_to_cpu(desc->rsvd3), 16, 8);
+
+    return abi ? abi : VIRT_LLM_KERNEL_ABI_VERSION;
+}
+
 static uint32_t virt_llm_scalar_dispatch(VirtLLMState *s, VirtLLMDesc *desc,
                                          uint32_t opcode)
 {
     uint32_t kernel_id = virt_llm_kernel_id(desc);
+    uint32_t kernel_abi = virt_llm_kernel_abi(desc);
+    const VirtLLMKernelMeta *kernel = virt_llm_find_kernel(kernel_id);
     uint32_t status;
 
     s->scalar_status = VIRT_LLM_SCALAR_RUNNING;
     s->scalar_last_kernel = kernel_id;
     s->scalar_last_opcode = opcode;
 
+    if (!kernel || kernel->opcode != opcode ||
+        kernel->abi_version != kernel_abi) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "virt-llm: bad scalar kernel id=%u abi=%u opcode=0x%04x\n",
+                      kernel_id, kernel_abi, opcode);
+        status = VIRT_LLM_DESC_BAD_KERNEL;
+        goto out;
+    }
+
     switch (opcode) {
     case VIRT_LLM_OP_VEC_ADD_U32:
-        status = kernel_id == VIRT_LLM_KERNEL_VEC_ADD_U32 ?
-                 virt_llm_process_vec_add_u32(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        status = virt_llm_process_vec_add_u32(s, desc);
         break;
     case VIRT_LLM_OP_DOT_U32:
-        status = kernel_id == VIRT_LLM_KERNEL_DOT_U32 ?
-                 virt_llm_process_dot_u32(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        status = virt_llm_process_dot_u32(s, desc);
         break;
     case VIRT_LLM_OP_SOFTMAX_Q16:
-        status = kernel_id == VIRT_LLM_KERNEL_SOFTMAX_Q16 ?
-                 virt_llm_process_softmax_q16(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        status = virt_llm_process_softmax_q16(s, desc);
         break;
     case VIRT_LLM_OP_POOL_MAX_U32:
-        status = kernel_id == VIRT_LLM_KERNEL_POOL_MAX_U32 ?
-                 virt_llm_process_pool_max_u32(s, desc) : VIRT_LLM_DESC_UNSUPP;
+        status = virt_llm_process_pool_max_u32(s, desc);
         break;
     default:
         status = VIRT_LLM_DESC_UNSUPP;
         break;
     }
 
+out:
     s->scalar_status = status == VIRT_LLM_DESC_COMPLETE ?
                        VIRT_LLM_SCALAR_IDLE : VIRT_LLM_SCALAR_ERROR;
     return status;
@@ -731,8 +759,10 @@ static void virt_llm_process_queue(VirtLLMState *s)
         if (status == VIRT_LLM_DESC_COMPLETE) {
             virt_llm_raise_irq(s, VIRT_LLM_IRQ_COMPLETE);
         } else {
-            virt_llm_queue_error(s, backend != UINT32_MAX ?
-                                 VIRT_LLM_Q_ERR_DESC : VIRT_LLM_Q_ERR_OPCODE);
+            virt_llm_queue_error(s,
+                                 backend == UINT32_MAX ? VIRT_LLM_Q_ERR_OPCODE :
+                                 status == VIRT_LLM_DESC_BAD_KERNEL ?
+                                 VIRT_LLM_Q_ERR_KERNEL : VIRT_LLM_Q_ERR_DESC);
         }
     }
 }

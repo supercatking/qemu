@@ -177,6 +177,8 @@ Commit boundary:
 
 ### Step 4.3: Enforced Kernel ABI Validation
 
+Status: implemented and validated.
+
 QEMU:
 
 - Replace hard-coded scalar kernel checks with table lookup.
@@ -195,6 +197,15 @@ Validation:
 - Existing positive self-tests still pass.
 - New negative kernel validation tests pass.
 - Unknown opcode still returns `DESC_UNSUPP`, not `DESC_BAD_KERNEL`.
+
+Validation result:
+
+```text
+virt_llm_pci ... bad kernel id self-test ok: desc_status=0x80000004 q_error=4
+virt_llm_pci ... bad kernel abi self-test ok: desc_status=0x80000004 q_error=4
+virt_llm_pci ... error path ok: desc_status=0x80000002 q_status=0x00000003 q_error=3
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
 
 ### Step 4.4: Kernel Binary Debug Metadata
 
