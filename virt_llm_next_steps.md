@@ -240,18 +240,35 @@ virt_llm_pci ... error path ok: ...
 INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
 ```
 
+## Implemented in the Vector Kernel Step
+
+This step extended the RISC-V vector backend:
+
+- Added `SOFTMAX_Q16`, a deterministic fixed-point normalization command.
+- Added `POOL_MAX_U32`, a deterministic max-pooling command.
+- Extended Linux validation with known-answer tests.
+- Kept completions flowing through the CQ path.
+
+Validation result:
+
+```text
+virt_llm_pci ... softmax q16 ok: count=4 checksum=0x00010000
+virt_llm_pci ... pool max ok: count=8 window=2 checksum=0x00000018
+INITRAMFS_OK: Linux 6.12 booted on QEMU riscv32
+```
+
 ## Immediate Next Coding Step
 
-The best next coding step is to add the remaining RISC-V vector-style kernels:
+The best next coding step is to make the command queue more realistic:
 
-1. Add `SOFTMAX_Q16` as a deterministic fixed-point vector backend command.
-2. Add `POOL_MAX_U32` as a deterministic vector backend command.
-3. Extend Linux validation with small known-answer tests.
-4. Keep all completions flowing through the CQ.
+1. Add command batching with several descriptors submitted before one kick.
+2. Add ring wrap-around tests for SQ and CQ.
+3. Add device-owned completion flags or generation bits.
+4. Add queue-full and CQ-full error handling.
 5. Re-run the riscv32 Linux 6.12 boot validation.
 
-This builds out the vector-processor side of the accelerator now that command
-dispatch and completion reporting are stable.
+This will make the front-end queue behave more like hardware instead of a
+single-command-at-a-time validation path.
 
 ## Implementation Phases for the LLM Accelerator Shape
 
